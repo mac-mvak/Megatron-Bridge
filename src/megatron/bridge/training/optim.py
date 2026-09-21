@@ -85,7 +85,20 @@ def setup_optimizer(
                 f"applied {len(mup_overrides)} optimizer param-group override(s)."
             )
 
-    if hasattr(optimizer_config, "provide"):
+    if optimizer_config.optimizer == "md_decoupling":
+        # MDDecoupling has its own parameter partitioning and cannot use the
+        # generic optimizer factory (which would flatten matrix parameters).
+        from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+
+        optimizer = get_megatron_mddecoupling_optimizer(
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=use_gloo_process_groups,
+            layer_wise_distributed_optimizer=optimizer_config.use_layer_wise_distributed_optimizer,
+            pg_collection=pg_collection,
+        )
+    elif hasattr(optimizer_config, "provide"):
         optimizer = optimizer_config.provide(
             model_chunks=model,
             config_overrides=config_overrides,
@@ -125,7 +138,10 @@ def _optimizer_state_is_fp32_adam(state_dict: Mapping[str, object]) -> bool:
     for state in states.values():
         if not isinstance(state, Mapping) or set(state) != expected_state_names:
             return False
-        if any(not isinstance(value, torch.Tensor) or value.dtype != torch.float32 for value in state.values()):
+        if any(
+            not isinstance(value, torch.Tensor) or value.dtype != torch.float32
+            for value in state.values()
+        ):
             return False
     return True
 
@@ -167,7 +183,11 @@ def memory_efficient_fp32_optimizer_state_loading(
         yield 0
         return
 
-    sub_optimizers = optimizer.chained_optimizers if hasattr(optimizer, "chained_optimizers") else [optimizer]
+    sub_optimizers = (
+        optimizer.chained_optimizers
+        if hasattr(optimizer, "chained_optimizers")
+        else [optimizer]
+    )
     missing_method = object()
     patched: list[tuple[torch.optim.Optimizer, object]] = []
 
@@ -177,7 +197,11 @@ def memory_efficient_fp32_optimizer_state_loading(
                 continue
             if not hasattr(distributed_optimizer, "shard_fp32_from_float16_groups"):
                 continue
-            if getattr(getattr(distributed_optimizer, "ddp_config", None), "use_megatron_fsdp", False):
+            if getattr(
+                getattr(distributed_optimizer, "ddp_config", None),
+                "use_megatron_fsdp",
+                False,
+            ):
                 continue
 
             config = getattr(distributed_optimizer, "config", None)
@@ -196,29 +220,42 @@ def memory_efficient_fp32_optimizer_state_loading(
 
             state_dtype_map = getattr(inner, "name_to_dtype_map", None)
             if not isinstance(state_dtype_map, Mapping) or any(
-                state_dtype_map.get(name) != torch.float32 for name in ("exp_avg", "exp_avg_sq")
+                state_dtype_map.get(name) != torch.float32
+                for name in ("exp_avg", "exp_avg_sq")
             ):
                 continue
 
-            params = [param for group in inner.param_groups for param in group["params"]]
+            params = [
+                param for group in inner.param_groups for param in group["params"]
+            ]
             if not params or any(param.dtype != torch.float32 for param in params):
                 continue
 
-            original_load_state_dict: Callable[[dict[str, object]], None] = inner.load_state_dict
+            original_load_state_dict: Callable[[dict[str, object]], None] = (
+                inner.load_state_dict
+            )
 
             def _load_state_dict_without_fp32_reallocation(
                 fused_adam: torch.optim.Optimizer,
                 state_dict: dict[str, object],
                 *,
-                _fallback: Callable[[dict[str, object]], None] = original_load_state_dict,
+                _fallback: Callable[
+                    [dict[str, object]], None
+                ] = original_load_state_dict,
             ) -> None:
                 if not _optimizer_state_is_fp32_adam(state_dict):
                     _fallback(state_dict)
                     return
                 torch.optim.Optimizer.load_state_dict(fused_adam, state_dict)
 
-            previous_instance_method = inner.__dict__.get("load_state_dict", missing_method)
-            setattr(inner, "load_state_dict", MethodType(_load_state_dict_without_fp32_reallocation, inner))
+            previous_instance_method = inner.__dict__.get(
+                "load_state_dict", missing_method
+            )
+            setattr(
+                inner,
+                "load_state_dict",
+                MethodType(_load_state_dict_without_fp32_reallocation, inner),
+            )
             patched.append((inner, previous_instance_method))
 
         if patched:
@@ -241,7 +278,9 @@ def memory_efficient_fp32_optimizer_state_loading(
             torch.cuda.empty_cache()
 
 
-def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer | None) -> bool:
+def sync_hybrid_device_optimizer_fp32_master_copies(
+    optimizer: MegatronOptimizer | None,
+) -> bool:
     """Refresh ``HybridDeviceOptimizer`` FP32 master copies from BF16 model parameters.
 
     Workaround for an upstream Megatron-Core gap: when a checkpoint is loaded
@@ -274,7 +313,9 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
         return False
 
     try:
-        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+            HybridDeviceOptimizer,
+        )
     except ImportError:
         return False
 
@@ -294,7 +335,9 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
                     continue
                 param_range_map = distrib_opt._get_model_param_range_map(model_param)
                 param_range = param_range_map["param"]
-                shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+                shard_model_param = model_param.view(-1)[
+                    param_range.start : param_range.end
+                ]
                 shard_main_param.data.copy_(shard_model_param)
 
         # Level 2: CPU clones the CPU sub-optimizer steps against.
@@ -324,7 +367,9 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
 
 
 def _get_scheduler(
-    optimizer_config: OptimizerConfig, scheduler_config: SchedulerConfig, optimizer: MegatronOptimizer
+    optimizer_config: OptimizerConfig,
+    scheduler_config: SchedulerConfig,
+    optimizer: MegatronOptimizer,
 ) -> OptimizerParamScheduler:
     """Get the optimizer parameter scheduler.
 
