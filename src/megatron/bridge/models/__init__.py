@@ -13,6 +13,12 @@
 # limitations under the License.
 
 # Import model providers for easy access
+from megatron.bridge.models.apertus2 import (
+    Apertus2Bridge,
+    Apertus2ModelBuilder,
+    Apertus2ModelConfig,
+    Apertus2ModelProvider,
+)
 from megatron.bridge.models.bailing import (
     BailingMoeV2Bridge,
 )
@@ -212,6 +218,11 @@ __all__ = [
     "RowParallelMapping",
     "AutoMapping",
     "BailingMoeV2Bridge",
+    # Apertus Models
+    "Apertus2Bridge",
+    "Apertus2ModelBuilder",
+    "Apertus2ModelConfig",
+    "Apertus2ModelProvider",
     # DeepSeek Models
     "DeepSeekV2Bridge",
     "DeepSeekV3Bridge",

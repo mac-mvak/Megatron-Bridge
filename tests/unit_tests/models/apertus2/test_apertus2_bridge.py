@@ -1,0 +1,262 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, Swiss AI Initiative. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for the Apertus2 model bridge."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from megatron.core.activations import sssglu_act
+
+from megatron.bridge.models.apertus2.apertus2_bridge import Apertus2Bridge
+from megatron.bridge.models.apertus2.apertus2_mapping import (
+    build_apertus2_mapping_registry,
+)
+
+
+def _hf_config(**overrides):
+    values = {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "attention_output_gate": True,
+        "embedding_multiplier": 8.0,
+        "gate_lower_bound": -5.0,
+        "head_dim": 8,
+        "hidden_act": "sssglu",
+        "hidden_size": 64,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+        "linear_attn_output_gate_bias": True,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 8,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 4,
+        "linear_value_head_dim": 8,
+        "max_position_embeddings": 8192,
+        "moe_intermediate_size": 32,
+        "moe_latent_size": 16,
+        "moe_layer_freq": [0, 1, 1, 1],
+        "moe_router_quantile_balancing_method": "sigmoid",
+        "n_group": 1,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "no_rope_layers": [1, 1, 0, 1],
+        "norm_topk_prob": True,
+        "num_attention_heads": 8,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 4,
+        "residual_multiplier": (2 * 4) ** -0.5,
+        "rms_norm_eps": 1e-5,
+        "rope_parameters": {
+            "rope_type": "llama3",
+            "rope_theta": 500000.0,
+            "factor": 8.0,
+            "partial_rotary_factor": 1.0,
+        },
+        "routed_scaling_factor": 2.5,
+        "sandwich_norm": True,
+        "sliding_window": None,
+        "tie_word_embeddings": False,
+        "torch_dtype": torch.bfloat16,
+        "use_qk_norm": True,
+        "use_quantile_balancing": True,
+        "vocab_size": 256,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _provider(**overrides):
+    values = {
+        "activation_func": sssglu_act,
+        "add_bias_linear": False,
+        "add_qkv_bias": False,
+        "attention_dropout": 0.0,
+        "attention_output_gate": True,
+        "bf16": True,
+        "ffn_hidden_size": 128,
+        "hidden_dropout": 0.0,
+        "hidden_size": 64,
+        "init_method_std": 0.02,
+        "kv_channels": 8,
+        "layer_types": (
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ),
+        "layernorm_epsilon": 1e-5,
+        "linear_attention_freq": [1, 1, 1, 0],
+        "linear_attention_safe_output_gate": True,
+        "linear_attention_safe_output_gate_lower_bound": -5.0,
+        "linear_attn_output_gate_bias": True,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 8,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 4,
+        "linear_value_head_dim": 8,
+        "moe_ffn_hidden_size": 32,
+        "moe_latent_size": 16,
+        "moe_layer_freq": [0, 1, 1, 1],
+        "moe_router_group_topk": None,
+        "moe_router_load_balancing_type": "quantile_balancing",
+        "moe_router_num_groups": None,
+        "moe_router_quantile_balancing_method": "histogram",
+        "moe_router_score_function": "sigmoid",
+        "moe_router_topk": 2,
+        "moe_router_topk_scaling_factor": 2.5,
+        "moe_shared_expert_intermediate_size": 32,
+        "no_rope_freq": [0, 0, 1, 0],
+        "normalization": "RMSNorm",
+        "num_attention_heads": 8,
+        "num_layers": 4,
+        "num_moe_experts": 8,
+        "num_query_groups": 4,
+        "residual_output_scaling": True,
+        "rope_scaling": True,
+        "rope_scaling_factor": 8.0,
+        "rotary_base": 500000.0,
+        "rotary_percent": 1.0,
+        "sandwich_norm": True,
+        "scale_embeddings_by_sqrt_hidden": True,
+        "seq_length": 8192,
+        "share_embeddings_and_output_weights": False,
+        "vocab_size": 256,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+class TestApertus2ConfigConversion:
+    def test_hf_to_megatron_preserves_apertus2_semantics(self):
+        result = Apertus2Bridge().hf_config_to_provider_kwargs(_hf_config())
+
+        assert result["layer_types"] == tuple(_hf_config().layer_types)
+        assert result["linear_attention_freq"] == [1, 1, 1, 0]
+        assert result["no_rope_freq"] == [0, 0, 1, 0]
+        assert result["moe_layer_freq"] == [0, 1, 1, 1]
+        assert result["moe_router_load_balancing_type"] == "quantile_balancing"
+        assert result["moe_router_quantile_balancing_method"] == "histogram"
+        assert result["moe_router_enable_expert_bias"] is False
+        assert result["activation_func"] is sssglu_act
+
+    def test_builder_config_preserves_apertus2_fields(self):
+        result = Apertus2Bridge().hf_config_to_model_config(_hf_config())
+
+        assert result.num_layers == 4
+        assert result.num_moe_experts == 8
+        assert result.moe_layer_freq == [0, 1, 1, 1]
+        assert result.experimental_attention_variant == "kda"
+        assert result.linear_attention_freq == [1, 1, 1, 0]
+        assert result.moe_router_load_balancing_type == "quantile_balancing"
+        assert result.moe_router_quantile_balancing_method == "histogram"
+        assert result.moe_shared_expert_intermediate_size == 32
+        assert result.share_embeddings_and_output_weights is False
+        assert result.transformer.layer_types == tuple(_hf_config().layer_types)
+        assert result.transformer.linear_attn_output_gate_bias is True
+        assert result.transformer_layer_spec is None
+
+    def test_non_qb_routing_enables_static_correction_buffer(self):
+        result = Apertus2Bridge().hf_config_to_provider_kwargs(_hf_config(use_quantile_balancing=False))
+
+        assert result["moe_router_load_balancing_type"] == "aux_loss"
+        assert result["moe_router_enable_expert_bias"] is True
+
+    @pytest.mark.parametrize(
+        ("use_qb", "routing"),
+        [
+            (False, "quantile_balancing"),
+            (True, "aux_loss"),
+            (False, ["quantile_balancing", "seq_aux_loss"]),
+        ],
+    )
+    def test_rejects_contradictory_quantile_balancing_config(self, use_qb, routing):
+        config = _hf_config(
+            use_quantile_balancing=use_qb,
+            moe_router_load_balancing_type=routing,
+        )
+
+        with pytest.raises(ValueError, match="use_quantile_balancing must match"):
+            Apertus2Bridge().hf_config_to_provider_kwargs(config)
+
+    def test_megatron_to_hf_config_is_reloadable(self):
+        result = Apertus2Bridge.megatron_to_hf_config(_provider())
+
+        assert result["architectures"] == ["Apertus2KDAForCausalLM"]
+        assert result["model_type"] == "apertus2"
+        assert result["hidden_act"] == "sssglu"
+        assert result["layer_types"] == list(_provider().layer_types)
+        assert result["no_rope_layers"] == [1, 1, 0, 1]
+        assert result["moe_layer_freq"] == [0, 1, 1, 1]
+        assert result["first_k_dense_replace"] == 1
+        assert result["n_routed_experts"] == 8
+        assert result["n_shared_experts"] == 1
+        assert result["use_quantile_balancing"] is True
+        assert result["moe_router_quantile_balancing_method"] == "sigmoid"
+        assert result["rope_parameters"] == {
+            "rope_type": "llama3",
+            "rope_theta": 500000.0,
+            "partial_rotary_factor": 1.0,
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+        }
+        assert result["linear_num_key_heads"] == 4
+        assert result["linear_num_value_heads"] == 4
+        assert result["gate_lower_bound"] == -5.0
+        assert result["linear_attn_output_gate_bias"] is True
+        assert "num_experts" not in result
+        assert "num_local_experts" not in result
+        assert "rope_theta" not in result
+
+    def test_softmax_export_uses_standard_architecture_and_omits_kda_geometry(self):
+        result = Apertus2Bridge.megatron_to_hf_config(
+            _provider(
+                layer_types=("full_attention",) * 4,
+                linear_attention_freq=[0, 0, 0, 0],
+                linear_attention_safe_output_gate=False,
+            )
+        )
+
+        assert result["architectures"] == ["Apertus2ForCausalLM"]
+        assert "linear_num_key_heads" not in result
+        assert "gate_lower_bound" not in result
+
+
+@pytest.mark.unit
+class TestApertus2MappingRegistry:
+    def test_non_qb_registry_maps_expert_correction_bias(self):
+        registry = build_apertus2_mapping_registry(_hf_config(use_quantile_balancing=False))
+        megatron_params = {str(mapping.megatron_param) for mapping in registry.mappings}
+
+        assert "decoder.layers.1.mlp.router.expert_bias" in megatron_params
+        assert "decoder.layers.1.mlp.router.qb_beta" not in megatron_params
+
+    def test_qb_registry_maps_beta_instead_of_correction_bias(self):
+        registry = build_apertus2_mapping_registry(_hf_config())
+        megatron_params = {str(mapping.megatron_param) for mapping in registry.mappings}
+
+        assert "decoder.layers.1.mlp.router.qb_beta" in megatron_params
+        assert "decoder.layers.1.mlp.router.expert_bias" not in megatron_params

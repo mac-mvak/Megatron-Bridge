@@ -1,0 +1,148 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, Swiss AI Initiative. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for Apertus2 KDA parameter mappings."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from megatron.bridge.models.apertus2.apertus2_mapping import (
+    KDAConv1dMapping,
+    KDAInProjMapping,
+    build_apertus2_mapping_registry,
+)
+from megatron.bridge.models.conversion.param_mapping import QKVGMapping, QKVMapping
+
+
+def _in_proj_mapping():
+    return KDAInProjMapping(
+        "decoder.layers.0.self_attention.in_proj.weight",
+        query="model.layers.0.self_attn.q_proj.weight",
+        key="model.layers.0.self_attn.k_proj.weight",
+        value="model.layers.0.self_attn.v_proj.weight",
+        decay_low_rank="model.layers.0.self_attn.f_a_proj.weight",
+        gate_low_rank="model.layers.0.self_attn.g_a_proj.weight",
+        beta="model.layers.0.self_attn.b_proj.weight",
+    )
+
+
+def _schedule_config(**overrides):
+    values = {
+        "attention_output_gate": True,
+        "layer_types": (
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+        ),
+        "moe_layer_freq": [0, 1, 0, 1],
+        "moe_router_enable_expert_bias": False,
+        "num_hidden_layers": 4,
+        "qk_layernorm": True,
+        "sandwich_norm": False,
+        "use_quantile_balancing": True,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+pytestmark = pytest.mark.unit
+
+
+def test_kda_in_proj_export_splits_globally_gathered_weight(monkeypatch):
+    mapping = _in_proj_mapping()
+    split_shapes = (8, 8, 16, 4, 4, 4)
+    fused = torch.arange(44 * 6).reshape(44, 6)
+    module = SimpleNamespace(weight=SimpleNamespace(kda_split_shapes=split_shapes))
+    monkeypatch.setattr(
+        mapping._tp_mapping,
+        "megatron_to_hf",
+        lambda megatron_weights, megatron_module: {"weight": fused},
+    )
+    monkeypatch.setattr(
+        mapping,
+        "broadcast_obj_from_pp_rank",
+        lambda value, description: value,
+    )
+
+    result = mapping.megatron_to_hf(torch.empty(0), module)
+    expected = torch.split(fused, split_shapes, dim=0)
+
+    assert list(result) == [str(mapping.hf_param[name]) for name in mapping._names]
+    for name, section in zip(mapping._names, expected):
+        assert torch.equal(result[str(mapping.hf_param[name])], section)
+
+
+def test_kda_in_proj_export_requires_split_metadata(monkeypatch):
+    mapping = _in_proj_mapping()
+    monkeypatch.setattr(
+        mapping._tp_mapping,
+        "megatron_to_hf",
+        lambda megatron_weights, megatron_module: {"weight": torch.empty(44, 6)},
+    )
+    monkeypatch.setattr(
+        mapping,
+        "broadcast_obj_from_pp_rank",
+        lambda value, description: value,
+    )
+
+    with pytest.raises(ValueError, match="missing kda_split_shapes metadata"):
+        mapping.megatron_to_hf(torch.empty(0), SimpleNamespace(weight=SimpleNamespace()))
+
+
+def test_kda_conv_sections_use_global_geometry(monkeypatch):
+    mapping = KDAConv1dMapping(
+        "decoder.layers.0.self_attention.conv1d.weight",
+        query="model.layers.0.self_attn.q_conv1d.weight",
+        key="model.layers.0.self_attn.k_conv1d.weight",
+        value="model.layers.0.self_attn.v_conv1d.weight",
+    )
+    config = SimpleNamespace(
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_num_value_heads=2,
+        linear_value_head_dim=8,
+    )
+    module = SimpleNamespace(config=config)
+    monkeypatch.setattr(mapping, "broadcast_obj_from_pp_rank", lambda value, description: value)
+
+    assert mapping._sections(module) == (8, 8, 16)
+
+
+def test_mapping_registry_follows_attention_and_moe_schedules():
+    registry = build_apertus2_mapping_registry(_schedule_config())
+
+    assert isinstance(
+        registry.megatron_to_hf_lookup("decoder.layers.0.self_attention.in_proj.weight"),
+        KDAInProjMapping,
+    )
+    assert isinstance(
+        registry.megatron_to_hf_lookup("decoder.layers.1.self_attention.linear_qkv.weight"),
+        QKVGMapping,
+    )
+    assert registry.megatron_to_hf_lookup("decoder.layers.0.mlp.linear_fc1.weight") is not None
+    assert registry.megatron_to_hf_lookup("decoder.layers.0.mlp.router.weight") is None
+    assert registry.megatron_to_hf_lookup("decoder.layers.1.mlp.router.weight") is not None
+    assert registry.megatron_to_hf_lookup("decoder.layers.1.mlp.router.qb_beta") is not None
+
+
+def test_mapping_registry_uses_qkv_without_attention_output_gate():
+    registry = build_apertus2_mapping_registry(_schedule_config(attention_output_gate=False))
+
+    mapping = registry.megatron_to_hf_lookup("decoder.layers.1.self_attention.linear_qkv.weight")
+    assert isinstance(mapping, QKVMapping)
+    assert not isinstance(mapping, QKVGMapping)
