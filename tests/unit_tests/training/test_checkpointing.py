@@ -41,6 +41,7 @@ from megatron.bridge.training.checkpointing import (
     _load_hf_pretrained_checkpoint,
     _load_model_state_dict,
     _load_non_persistent_base_checkpoint,
+    _model_sharded_state_dict_metadata,
     _record_dataloader_state_dir,
     _save_hf_adapter_weights,
     _save_hf_weights,
@@ -2388,6 +2389,28 @@ class TestRecordDataloaderStateDir:
     def test_none_context_is_noop(self):
         """Must not raise when there is no context to record into."""
         _record_dataloader_state_dir(None, "/ckpt")
+
+
+class TestLegacyModelShardedStateDictMetadata:
+    """Test legacy offloaded-expert checkpoint metadata recovery."""
+
+    def test_marks_precanonical_offloaded_experts(self):
+        checkpoint_args = Mock(moe_use_offloading_experts=True)
+
+        metadata = _model_sharded_state_dict_metadata({"args": checkpoint_args}, None)
+
+        assert metadata == {
+            "moe_expert_checkpoint_schema": "legacy_offloading",
+            "moe_expert_checkpoint_has_te_extra_state": False,
+        }
+
+    def test_preserves_explicit_checkpoint_schema(self):
+        checkpoint_args = Mock(moe_use_offloading_experts=True)
+        saved_metadata = {"moe_expert_checkpoint_schema": "sequential"}
+
+        metadata = _model_sharded_state_dict_metadata({"args": checkpoint_args}, saved_metadata)
+
+        assert metadata == saved_metadata
 
 
 class TestLoadModelWeightsFromCheckpoint:

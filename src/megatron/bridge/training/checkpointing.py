@@ -2182,6 +2182,22 @@ def _create_fsdp_dtensor_storage_writer(checkpoint_path: str) -> Any:
     return torch.distributed.checkpoint.FileSystemWriter(checkpoint_path)
 
 
+# NOTE: Previous versions of Apertus Megatron-LM-MoE (https://github.com/swiss-ai/Megatron-LM-MoE) had the expert offloading checkpoints with its own schema, instead of using the default TEGroupedMLP schema.
+# This is a temporary fix to allow loading legacy checkpoints with expert offloading enabled (Megatron-LM-MoE has the conversion code).
+def _model_sharded_state_dict_metadata(common_state_dict: StateDict, content_metadata: Optional[dict]) -> dict:
+    """Add compatibility metadata needed to load legacy native Megatron checkpoints."""
+    metadata = dict(content_metadata or {})
+    checkpoint_args = common_state_dict.get("args")
+
+    if (
+        getattr(checkpoint_args, "moe_use_offloading_experts", False)
+        and "moe_expert_checkpoint_schema" not in metadata
+    ):
+        metadata["moe_expert_checkpoint_schema"] = "legacy_offloading"
+        metadata["moe_expert_checkpoint_has_te_extra_state"] = False
+    return metadata
+
+
 def _load_model_weights_from_checkpoint(
     checkpoint_path: str,
     model: list[MegatronModule],
@@ -2218,7 +2234,10 @@ def _load_model_weights_from_checkpoint(
     state_dict = dist_checkpointing.load_common_state_dict(checkpoint_path)
     assert state_dict is not None
 
-    sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
+    sharded_sd_metadata = _model_sharded_state_dict_metadata(
+        state_dict,
+        dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict),
+    )
     print_rank_0(f"sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}")
     model_sd_kwargs = dict(metadata=sharded_sd_metadata)
 
