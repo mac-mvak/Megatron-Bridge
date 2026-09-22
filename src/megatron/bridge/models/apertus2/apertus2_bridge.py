@@ -139,6 +139,13 @@ def _multiplier_flag(value: Any, expected: float, field_name: str) -> bool:
     provider=Apertus2ModelProvider,
     model_type="apertus2",
 )
+# NOTE: Alias name, because in VLLM this is the name we are using, we should change VLLM registry
+@MegatronModelBridge.register_bridge(  # ty: ignore[invalid-argument-type]
+    source="Apertus2KDAForCausalLM",
+    target=GPTModel,
+    provider=Apertus2ModelProvider,
+    model_type="apertus2",
+)
 class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
     """Bridge Apertus2 configs while retaining MCore's virtual KDA checkpoint keys."""
 
