@@ -39,6 +39,10 @@ class _LegacyConfigView:
         self._args = args
 
     def __getattr__(self, name: str) -> Any:
+        if name in {"bf16", "fp16"} and hasattr(self._args, name):
+            return getattr(self._args, name)
+        if name in {"fp8", "fp8_param"} and getattr(self._args, name, None) is not None:
+            return getattr(self._args, name)
         value = getattr(self._config, name, None)
         if value is not None:
             return value

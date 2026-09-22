@@ -20,10 +20,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 from megatron.core.activations import sssglu_act
+from megatron.core.ssm.kimi_delta_attention import KimiDeltaAttention
 
 from megatron.bridge.models.apertus2.apertus2_bridge import Apertus2Bridge
 from megatron.bridge.models.apertus2.apertus2_mapping import (
     build_apertus2_mapping_registry,
+)
+from megatron.bridge.models.apertus2.apertus2_provider import (
+    Apertus2ModelProvider,
+    _preserve_kda_decay_parameters,
 )
 
 
@@ -159,6 +164,9 @@ class TestApertus2ConfigConversion:
         assert result["moe_router_load_balancing_type"] == "quantile_balancing"
         assert result["moe_router_quantile_balancing_method"] == "histogram"
         assert result["moe_router_enable_expert_bias"] is False
+        assert result["bf16"] is True
+        assert result["fp16"] is False
+        assert result["params_dtype"] is torch.bfloat16
         assert result["activation_func"] is sssglu_act
 
     def test_builder_config_preserves_apertus2_fields(self):
@@ -172,6 +180,9 @@ class TestApertus2ConfigConversion:
         assert result.moe_router_load_balancing_type == "quantile_balancing"
         assert result.moe_router_quantile_balancing_method == "histogram"
         assert result.moe_shared_expert_intermediate_size == 32
+        assert result.bf16 is True
+        assert result.fp16 is False
+        assert result.params_dtype is torch.bfloat16
         assert result.share_embeddings_and_output_weights is False
         assert result.transformer.layer_types == tuple(_hf_config().layer_types)
         assert result.transformer.linear_attn_output_gate_bias is True
@@ -206,6 +217,7 @@ class TestApertus2ConfigConversion:
         assert result["architectures"] == ["Apertus2KDAForCausalLM"]
         assert result["model_type"] == "apertus2"
         assert result["hidden_act"] == "sssglu"
+        assert result["torch_dtype"] == "bfloat16"
         assert result["layer_types"] == list(_provider().layer_types)
         assert result["no_rope_layers"] == [1, 1, 0, 1]
         assert result["moe_layer_freq"] == [0, 1, 1, 1]
@@ -231,6 +243,21 @@ class TestApertus2ConfigConversion:
         assert "num_local_experts" not in result
         assert "rope_theta" not in result
 
+    def test_export_keeps_kda_decay_parameters_in_fp32(self):
+        weights = {
+            "model.layers.0.self_attn.q_proj.weight": torch.ones(2, dtype=torch.float32),
+            "model.layers.0.self_attn.A_log": torch.ones(2, dtype=torch.bfloat16),
+            "model.layers.0.self_attn.dt_bias": torch.ones(2, dtype=torch.bfloat16),
+            "integer_buffer": torch.ones(2, dtype=torch.int64),
+        }
+
+        result = Apertus2Bridge._cast_export_weight_dtype(weights, torch.bfloat16)
+
+        assert result["model.layers.0.self_attn.q_proj.weight"].dtype is torch.bfloat16
+        assert result["model.layers.0.self_attn.A_log"].dtype is torch.float32
+        assert result["model.layers.0.self_attn.dt_bias"].dtype is torch.float32
+        assert result["integer_buffer"].dtype is torch.int64
+
     def test_softmax_export_uses_standard_architecture_and_omits_kda_geometry(self):
         result = Apertus2Bridge.megatron_to_hf_config(
             _provider(
@@ -243,6 +270,27 @@ class TestApertus2ConfigConversion:
         assert result["architectures"] == ["Apertus2ForCausalLM"]
         assert "linear_num_key_heads" not in result
         assert "gate_lower_bound" not in result
+
+
+@pytest.mark.unit
+class TestApertus2MixedPrecision:
+    def test_provider_registers_kda_precision_hook(self):
+        provider = Apertus2ModelProvider()
+
+        assert _preserve_kda_decay_parameters in provider._pre_wrap_hooks
+
+    def test_preserves_kda_decay_parameters_in_fp32(self):
+        module = KimiDeltaAttention.__new__(KimiDeltaAttention)
+        torch.nn.Module.__init__(module)
+        module.A_log = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+        module.dt_bias = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+
+        result = _preserve_kda_decay_parameters([module])
+
+        assert result == [module]
+        assert module.A_log.dtype is torch.float32
+        assert module.dt_bias.dtype is torch.float32
+        assert module._keep_in_float32_parameter_names == ("A_log", "dt_bias")
 
 
 @pytest.mark.unit

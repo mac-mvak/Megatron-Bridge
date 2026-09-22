@@ -18,15 +18,35 @@
 from dataclasses import dataclass
 from typing import Callable
 
+import torch
 from megatron.core.activations import sssglu_act
+from megatron.core.ssm.kimi_delta_attention import KimiDeltaAttention
 
 from megatron.bridge.models.apertus2.apertus2_spec import build_apertus2_spec
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 
 
+def _preserve_kda_decay_parameters(model: list[torch.nn.Module]) -> list[torch.nn.Module]:
+    """Keep native KDA decay parameters in FP32 through mixed-precision wrapping."""
+    for model_chunk in model:
+        for module in model_chunk.modules():
+            if not isinstance(module, KimiDeltaAttention):
+                continue
+            module.A_log.data = module.A_log.data.float()
+            module.dt_bias.data = module.dt_bias.data.float()
+            module._keep_in_float32_parameter_names = ("A_log", "dt_bias")
+    return model
+
+
 @dataclass
 class Apertus2ModelProvider(GPTModelProvider):
     """Provider for Apertus2's standard attention / native MCore KDA stack."""
+
+    def __post_init__(self) -> None:
+        """Install the native KDA mixed-precision preservation hook."""
+        super().__post_init__()
+        if not hasattr(self, "_pre_wrap_hooks") or _preserve_kda_decay_parameters not in self._pre_wrap_hooks:
+            self.register_pre_wrap_hook(_preserve_kda_decay_parameters, prepend=True)
 
     # Authoritative Apertus2 checkpoint semantics.  These defaults are intentionally different
     # from the generic GPT provider and prevent a plain provider construction from silently tying

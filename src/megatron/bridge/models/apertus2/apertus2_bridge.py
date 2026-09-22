@@ -35,6 +35,9 @@ from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.transformers_compat import rope_theta_from_hf
 
 
+_FP32_EXPORT_SUFFIXES = (".A_log", ".dt_bias")
+
+
 def _schedule_from_hf(hf_config: Any) -> tuple[str, ...]:
     """Read and validate the authoritative per-layer attention schedule."""
     num_layers = int(hf_config.num_hidden_layers)
@@ -232,6 +235,8 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
         num_layers = int(hf_config.num_hidden_layers)
         embedding_multiplier = getattr(hf_config, "embedding_multiplier", 1.0)
         residual_multiplier = getattr(hf_config, "residual_multiplier", 1.0)
+
+        params_dtype = self.dtype_from_hf(hf_config, default=torch.bfloat16)
         kwargs: dict[str, Any] = {
             "vocab_size": hf_config.vocab_size,
             # Keep the outer GPT model faithful in both the legacy provider and
@@ -296,7 +301,9 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
             "attention_softmax_in_fp32": True,
             "transformer_impl": "transformer_engine",
             "moe_grouped_gemm": True,
-            "params_dtype": self.dtype_from_hf(hf_config, default=torch.bfloat16),
+            "fp16": params_dtype == torch.float16,
+            "bf16": params_dtype == torch.bfloat16,
+            "params_dtype": params_dtype,
             "activation_func": _activation_from_hf(getattr(hf_config, "hidden_act", "silu")),
             "transformer_layer_spec": build_apertus2_spec,
         }
@@ -483,6 +490,22 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
                 }
             )
         return hf_config
+
+    @staticmethod
+    def _cast_export_weight_dtype(
+        weights: dict[str, torch.Tensor], weight_dtype: torch.dtype | None
+    ) -> dict[str, torch.Tensor]:
+        """Keep KDA decay parameters in FP32 while casting ordinary weights."""
+        return {
+            name: (
+                weight.float()
+                if name.endswith(_FP32_EXPORT_SUFFIXES)
+                else weight.to(weight_dtype)
+                if weight_dtype is not None and weight.is_floating_point()
+                else weight
+            )
+            for name, weight in weights.items()
+        }
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """Return schedule-specific virtual-key mappings."""
