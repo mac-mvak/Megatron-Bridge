@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from megatron.bridge.models.apertus2.apertus2_mapping import (
+    Apertus2QKVGMapping,
     KDAConv1dMapping,
     KDAInProjMapping,
     build_apertus2_mapping_registry,
@@ -123,6 +124,47 @@ def test_kda_conv_sections_use_global_geometry(monkeypatch):
     assert mapping._sections(module) == (8, 8, 16)
 
 
+def test_apertus2_qkvg_mapping_preserves_channelwise_gate(monkeypatch):
+    mapping = Apertus2QKVGMapping("linear_qkv.weight", q="q", k="k", v="v", g="g")
+    config = SimpleNamespace(
+        attention_output_gate=True,
+        hidden_size=5,
+        kv_channels=3,
+        num_attention_heads=4,
+        num_query_groups=2,
+    )
+    module = SimpleNamespace(config=config)
+    weights = {
+        "q": torch.arange(12 * 5).reshape(12, 5),
+        "k": torch.arange(6 * 5).reshape(6, 5) + 1_000,
+        "v": torch.arange(6 * 5).reshape(6, 5) + 2_000,
+        "g": torch.arange(12 * 5).reshape(12, 5) + 3_000,
+    }
+    monkeypatch.setattr(
+        mapping._tp_mapping,
+        "hf_to_megatron",
+        lambda merged, megatron_module: merged,
+    )
+    fused = mapping.hf_to_megatron(weights, module)
+    assert fused.shape == (36, 5)
+
+    monkeypatch.setattr(
+        mapping._tp_mapping,
+        "megatron_to_hf",
+        lambda megatron_weights, megatron_module: {"weight": fused},
+    )
+    monkeypatch.setattr(
+        mapping,
+        "broadcast_obj_from_pp_rank",
+        lambda value, description: value,
+    )
+    restored = mapping.megatron_to_hf(fused, module)
+
+    assert restored["g"].shape == (12, 5)
+    for name, expected in weights.items():
+        assert torch.equal(restored[name], expected)
+
+
 def test_mapping_registry_follows_attention_and_moe_schedules():
     registry = build_apertus2_mapping_registry(_schedule_config())
 
@@ -132,7 +174,7 @@ def test_mapping_registry_follows_attention_and_moe_schedules():
     )
     assert isinstance(
         registry.megatron_to_hf_lookup("decoder.layers.1.self_attention.linear_qkv.weight"),
-        QKVGMapping,
+        Apertus2QKVGMapping,
     )
     assert registry.megatron_to_hf_lookup("decoder.layers.0.mlp.linear_fc1.weight") is not None
     assert registry.megatron_to_hf_lookup("decoder.layers.0.mlp.router.weight") is None

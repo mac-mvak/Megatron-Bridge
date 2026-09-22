@@ -30,6 +30,80 @@ from megatron.bridge.models.conversion.param_mapping import (
     ReplicatedMapping,
     RowParallelMapping,
 )
+from megatron.bridge.models.conversion.utils import remove_non_pickleables
+
+
+class Apertus2QKVGMapping(QKVGMapping):
+    """
+    Preserve the channelwise attention-output gate used by Apertus2.
+    The implementation in Megatron-LM at least from around March 2026 uses Channel wise instead of head wise like here in Megatron Bridge.
+    """
+
+    @staticmethod
+    def _split(config, fused: torch.Tensor):
+        num_heads = int(config.num_attention_heads)
+        num_groups = int(config.num_query_groups)
+        heads_per_group = num_heads // num_groups
+        head_dim = int(config.kv_channels or (config.hidden_size // num_heads))
+        feature_dim = fused.shape[-1]
+        rows_per_group = 2 * heads_per_group + 2
+        reshaped = fused.view(2 * num_heads + 2 * num_groups, head_dim, feature_dim)
+        q_indices = torch.cat(
+            [
+                torch.arange(rows_per_group * group, rows_per_group * group + heads_per_group)
+                for group in range(num_groups)
+            ]
+        )
+        g_indices = q_indices + heads_per_group
+        k_indices = torch.arange(rows_per_group - 2, reshaped.shape[0], rows_per_group)
+        v_indices = k_indices + 1
+        return tuple(
+            reshaped[indices].reshape(-1, feature_dim) for indices in (q_indices, k_indices, v_indices, g_indices)
+        )
+
+    @staticmethod
+    def _merge(config, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor):
+        num_heads = int(config.num_attention_heads)
+        num_groups = int(config.num_query_groups)
+        heads_per_group = num_heads // num_groups
+        head_dim = int(config.kv_channels or (config.hidden_size // num_heads))
+        feature_dim = q.shape[-1]
+        q = q.view(num_heads, head_dim, feature_dim)
+        g = g.view(num_heads, head_dim, feature_dim)
+        k = k.view(num_groups, head_dim, feature_dim)
+        v = v.view(num_groups, head_dim, feature_dim)
+        groups = []
+        for group in range(num_groups):
+            start = group * heads_per_group
+            stop = start + heads_per_group
+            groups.extend((q[start:stop], g[start:stop], k[group : group + 1], v[group : group + 1]))
+        return torch.cat(groups, dim=0).reshape(-1, feature_dim)
+
+    def hf_to_megatron(self, hf_weights, megatron_module):
+        merged = None
+        if self.tp_rank == 0:
+            config = self._get_config(megatron_module)
+            merged = self._merge(config, hf_weights["q"], hf_weights["k"], hf_weights["v"], hf_weights["g"])
+        return self._tp_mapping.hf_to_megatron(merged, megatron_module)
+
+    def megatron_to_hf(self, megatron_weights, megatron_module):
+        if megatron_weights is not None:
+            megatron_weights = self.maybe_dequantize(megatron_weights)
+        if megatron_module is None:
+            config = self.broadcast_obj_from_pp_rank(None, "apertus2_qkvg_config")
+        else:
+            config = remove_non_pickleables(self._get_config(megatron_module), max_depth=3)
+            config = self.broadcast_obj_from_pp_rank(config, "apertus2_qkvg_config")
+        packed = self._tp_mapping.megatron_to_hf(megatron_weights, megatron_module)
+        if not packed:
+            return {}
+        q, k, v, g = self._split(config, next(iter(packed.values())))
+        return {
+            self.hf_param["q"]: q,
+            self.hf_param["k"]: k,
+            self.hf_param["v"]: v,
+            self.hf_param["g"]: g,
+        }
 
 
 class KDAInProjMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
@@ -205,7 +279,7 @@ def _model_mappings(config, *, include_expert_bias: bool) -> MegatronMappingRegi
             )
         else:
             qkv_mapping = (
-                QKVGMapping(
+                Apertus2QKVGMapping(
                     f"{attn}.linear_qkv.weight",
                     q=f"{hf_attn}.q_proj.weight",
                     k=f"{hf_attn}.k_proj.weight",
