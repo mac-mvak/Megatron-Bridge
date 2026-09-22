@@ -35,7 +35,7 @@ from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.transformers_compat import rope_theta_from_hf
 
 
-_FP32_EXPORT_SUFFIXES = (".A_log", ".dt_bias")
+_FP32_EXPORT_SUFFIXES = (".A_log", ".dt_bias", ".gate.qb_beta")
 
 
 def _schedule_from_hf(hf_config: Any) -> tuple[str, ...]:
@@ -502,7 +502,7 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
     def _cast_export_weight_dtype(
         weights: dict[str, torch.Tensor], weight_dtype: torch.dtype | None
     ) -> dict[str, torch.Tensor]:
-        """Keep KDA decay parameters in FP32 while casting ordinary weights."""
+        """Keep precision-sensitive checkpoint state in FP32 while casting ordinary weights."""
         return {
             name: (
                 weight.float()
