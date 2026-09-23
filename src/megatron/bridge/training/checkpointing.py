@@ -2248,6 +2248,14 @@ def _load_model_weights_from_checkpoint(
     pg_collection = get_pg_collection(model)
     sharded_state_dict = _generate_model_state_dict(model, model_sd_kwargs, pg_collection=pg_collection)
 
+    if sharded_sd_metadata.get("moe_expert_checkpoint_schema") == "legacy_offloading":
+        from megatron.bridge.training.moe_checkpoint import adapt_offloaded_expert_state_dict
+
+        adapt_offloaded_expert_state_dict(
+            sharded_state_dict,
+            has_te_extra_state=sharded_sd_metadata.get("moe_expert_checkpoint_has_te_extra_state", False),
+        )
+
     load_strategy = TorchDistLoadShardedStrategy()
     if fully_parallel_load:
         pg_collection = get_pg_collection(model)

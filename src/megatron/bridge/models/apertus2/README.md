@@ -18,6 +18,13 @@ after TP gather. Decay parameters and QB router state retain FP32 precision duri
 mixed-precision wrapping and export. BF16 source decay values can therefore be
 represented exactly in FP32, while their serialized dtype changes.
 
+Native offloaded experts retain their `weight1`/`weight2` checkpoint format.
+During a weight-only load, Bridge detects `moe_use_offloading_experts` in the
+checkpoint arguments and adapts standard expert requests to those keys and their
+input/output matrix orientation. Existing GLU factories and TP/EP offsets are
+preserved. Native offloading modules load their own keys directly. This read
+adapter does not change checkpoint files or either implementation's save format.
+
 ## Native dependency
 
 Use the accompanying Swiss Megatron-LM `apertus2/bridge-support` changes based on
@@ -51,6 +58,10 @@ uv run python -m torch.distributed.run --standalone --nproc_per_node=1 \
 uv run python -m torch.distributed.run --standalone --nproc_per_node=2 \
   -m pytest --confcutdir=tests/functional_tests/test_groups/models/apertus2 \
   tests/functional_tests/test_groups/models/apertus2/test_apertus2_conversion.py -q -x
+
+uv run python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  -m pytest --confcutdir=tests/functional_tests/test_groups/models/apertus2 \
+  tests/functional_tests/test_groups/models/apertus2/test_offloaded_checkpoint.py -q -x
 ```
 
 The hybrid test covers both provider and builder construction, native distributed
@@ -59,6 +70,14 @@ QB state, distinct channel decay scales,
 logit cosine similarity of at least 0.99, matching next-token predictions, HF
 prefill/cached-decode agreement, and native backward passes. Each pytest output
 directory also contains `parity.json` with measured errors.
+
+The offloading test writes real native `weight1`/`weight2` distributed checkpoints
+using fused expert BF16 master weights in both fine-grained and coarse-grained
+offloading modes. After zeroing parameters, it verifies native reload, standard
+Bridge expert reload, and exact HF tensor values and dtypes. It covers EP=2 and
+PP=2 separately, writes and reloads HF safetensors with PP=2, and checks logits
+and next-token agreement with EP=2. Unit tests also verify TP=1/2/4 shard offsets
+and GLU reconstruction for both expert projections.
 
 For the KDA layer matrix, run `kda_parity.py` in the same test directory with
 `--hf-source "$HF_EXPORT"` under one- and two-process torchrun. It checks all four
@@ -76,17 +95,30 @@ uv run python scripts/conversion/generate_apertus2_run_config.py \
 Generation reads metadata from every KDA layer, rejects mixed or invalid layouts,
 and validates the YAML round trip. It does not rewrite checkpoint tensors. A
 checkpoint view used for conversion must also contain the original checkpoint
-files, for example through links. Legacy offloaded-expert loading still requires
-the compatible native fork and the existing Bridge checkpoint compatibility path.
+files, for example through links. Loading offloaded-expert checkpoints requires
+the compatible native fork and the Bridge read adapter described above.
 
 ## Validation boundary
 
-The production export's configuration and all 239 safetensors headers were
-audited: 46,051 tensors, 45 per-channel KDA layers without gate bias, and 58 FP32
-QB buffers. The GPU tests use small models with the same relevant features.
-They do not establish full 594B-parameter checkpoint execution, large-scale
-conversion throughput, or PP/EP/FSDP parity. Native KDA cached inference remains
-unsupported by the native implementation; HF cached decoding is tested.
+The full `megachonk_iter_0000008` native checkpoint was loaded through Bridge on
+2026-09-23 using 32 GPUs, TP=1, PP=8 and EP=4. All 593,659,004,544 parameter
+elements were materialized on GPUs and passed finite-value checks. The same
+loaded model exported successfully to 239 HF safetensors shards containing
+46,051 tensors. Loading took 342.4 seconds and export took 273.7 seconds in this
+run. Temporary expert merges used Megatron's CPU fallback when GPU allocation
+failed; every final model parameter remained on a GPU.
+
+Every exported tensor was then compared against the independent hfconverter
+export: identical shapes and values for all 46,051 tensors, with 90 KDA decay
+tensors promoted losslessly from BF16 to FP32. Other tensor dtypes match the
+reference. The exported model/configuration Python files are byte-identical to
+the hfconverter implementation. A separate full native-offloading load also
+passed using the original `weight1`/`weight2` checkpoint format.
+
+Small-model GPU tests additionally verify forward/backward behavior. Full-model
+inference/training and FSDP parity have not been established. Native KDA cached
+inference remains unsupported by the native implementation; HF cached decoding
+is tested.
 Sliding-window attention and virtual pipeline parallelism retain their explicit
 unsupported checks in this adapter.
 
