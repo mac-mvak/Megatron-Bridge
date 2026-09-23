@@ -71,9 +71,10 @@ def _apply_mixed_precision_wrapper(
         for submodule in model_module.modules():
             # Preserve the existing MCore expert-bias contract.
             if hasattr(submodule, "_maintain_float32_expert_bias"):
-                expert_bias = getattr(submodule, "expert_bias", None)
-                if expert_bias is not None:
-                    keep_in_fp32.append((submodule, "expert_bias", expert_bias.data.clone()))
+                for buffer_name in ("expert_bias", "qb_beta"):
+                    buffer = getattr(submodule, buffer_name, None)
+                    if buffer is not None:
+                        keep_in_fp32.append((submodule, buffer_name, buffer.data.float().clone()))
 
             # Model-specific modules can mark direct parameters that must not be
             # truncated by Float16Module's recursive half()/bfloat16() cast.

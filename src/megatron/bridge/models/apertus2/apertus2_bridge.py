@@ -35,7 +35,7 @@ from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.transformers_compat import rope_theta_from_hf
 
 
-_FP32_EXPORT_SUFFIXES = (".A_log", ".dt_bias", ".gate.qb_beta")
+_FP32_EXPORT_SUFFIXES = (".A_log", ".dt_bias", ".gate.qb_beta", ".gate.e_score_correction_bias")
 
 
 def _schedule_from_hf(hf_config: Any) -> tuple[str, ...]:
@@ -173,16 +173,22 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
                 raise ValueError(f"KDA geometry must be positive integers, got {geometry!r}")
             if geometry["linear_num_key_heads"] != geometry["linear_num_value_heads"]:
                 raise ValueError("KDA key/value head counts must match")
-            # ``None`` is the HF config's omitted/default value and means the fork's
-            # checkpoint contract (the g_b_proj bias is present).  False is reserved for
-            # Kimi-Linear-style bias-free exports, which this adapter intentionally rejects.
             gate_bias = getattr(hf_config, "linear_attn_output_gate_bias", None)
-            if gate_bias is not None and gate_bias is not True:
-                raise ValueError("Apertus2 Bridge requires the exported KDA g_b_proj bias")
+            if gate_bias is None:
+                gate_bias = True
+            if not isinstance(gate_bias, bool):
+                raise ValueError("linear_attn_output_gate_bias must be a boolean")
+            per_channel = getattr(hf_config, "linear_attn_a_log_per_channel", None)
+            if per_channel is None:
+                per_channel = False
+            if not isinstance(per_channel, bool):
+                raise ValueError("linear_attn_a_log_per_channel must be a boolean")
             if bool(getattr(hf_config, "linear_attention_full_rank_output_gate", False)):
                 raise ValueError("Apertus2 Bridge requires the low-rank KDA output gate")
         else:
             geometry = {}
+            gate_bias = True
+            per_channel = False
 
         tie_embeddings = bool(getattr(hf_config, "tie_word_embeddings", False))
         if tie_embeddings:
@@ -285,7 +291,8 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
             "linear_attention_safe_output_gate": bound is not None,
             "linear_attention_safe_output_gate_lower_bound": (float(bound) if bound is not None else -5.0),
             "linear_attention_output_gate_form": "per_channel",
-            "linear_attn_output_gate_bias": True,
+            "linear_attn_output_gate_bias": gate_bias,
+            "linear_attn_a_log_per_channel": per_channel,
             "normalization": "RMSNorm",
             "qk_layernorm": bool(getattr(hf_config, "use_qk_norm", True)),
             "gated_linear_unit": True,
@@ -494,6 +501,7 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
                         else None
                     ),
                     "linear_attn_output_gate_bias": bool(getattr(provider, "linear_attn_output_gate_bias", True)),
+                    "linear_attn_a_log_per_channel": bool(getattr(provider, "linear_attn_a_log_per_channel", False)),
                 }
             )
         return hf_config

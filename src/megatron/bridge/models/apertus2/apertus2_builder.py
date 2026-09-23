@@ -34,6 +34,7 @@ class Apertus2TransformerConfig(TransformerConfig):
 
     layer_types: tuple[str, ...] | None = None
     linear_attn_output_gate_bias: bool = True
+    linear_attn_a_log_per_channel: bool = False
 
 
 @dataclass(kw_only=True)
@@ -60,12 +61,16 @@ class Apertus2ModelBuilder(GPTModelBuilder):
         # GPTModelBuilder reads this selector from the outer GPT model config, not
         # from the nested TransformerConfig. Keep the caller's config untouched.
         model_config.transformer_layer_spec = build_apertus2_spec
-        return GPTModelBuilder(model_config).build_model(
+        model = GPTModelBuilder(model_config).build_model(
             pg_collection,
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
         )
+        from megatron.bridge.models.apertus2.apertus2_provider import _preserve_kda_decay_parameters
+
+        _preserve_kda_decay_parameters([model])
+        return model
 
 
 __all__ = ["Apertus2ModelBuilder", "Apertus2ModelConfig", "Apertus2TransformerConfig"]

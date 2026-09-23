@@ -21,9 +21,12 @@ import pytest
 import torch
 
 from megatron.bridge.models.apertus2.apertus2_mapping import (
+    Apertus2QBMapping,
     Apertus2QKVGMapping,
     KDAConv1dMapping,
     KDAInProjMapping,
+    _pack_tp_sections,
+    _unpack_tp_sections,
     build_apertus2_mapping_registry,
 )
 from megatron.bridge.models.conversion.param_mapping import QKVGMapping, QKVMapping
@@ -62,6 +65,51 @@ def _schedule_config(**overrides):
 
 
 pytestmark = pytest.mark.unit
+
+
+def test_qb_mapping_preserves_thresholds_and_hf_zero_buffer():
+    mapping = Apertus2QBMapping("qb_beta", beta="gate.qb_beta", correction="gate.e_score_correction_bias")
+    module = torch.nn.Linear(4, 4, bias=False)
+    module.config = SimpleNamespace(params_dtype=torch.bfloat16)
+    beta = torch.tensor([0.1234567, -0.2345678, 0.3456789, -0.4567891])
+    weights = {"beta": beta, "correction": torch.zeros(4, dtype=torch.float32)}
+    loaded = mapping.hf_to_megatron(weights, module)
+    result = mapping.megatron_to_hf(loaded, module)
+    torch.testing.assert_close(result["gate.qb_beta"], beta, rtol=0, atol=0)
+    torch.testing.assert_close(result["gate.e_score_correction_bias"], weights["correction"], rtol=0, atol=0)
+
+
+def test_qb_mapping_rejects_lossy_nonzero_correction_buffer():
+    mapping = Apertus2QBMapping("qb_beta", beta="gate.qb_beta", correction="gate.e_score_correction_bias")
+    with pytest.raises(ValueError, match="zero e_score_correction_bias"):
+        mapping.hf_to_megatron({"beta": torch.zeros(4), "correction": torch.ones(4)}, None)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("shapes", [(8, 8, 16, 4, 4, 4), (8, 8, 16)])
+def test_kda_sections_match_native_rank_layout(tp_size, shapes):
+    sections = [torch.arange(size * 3).reshape(size, 3) + 1000 * index for index, size in enumerate(shapes)]
+    packed = _pack_tp_sections(sections, tp_size)
+    for rank, shard in enumerate(packed.chunk(tp_size)):
+        expected = torch.cat([section.chunk(tp_size)[rank] for section in sections])
+        torch.testing.assert_close(shard, expected, rtol=0, atol=0)
+    for expected, restored in zip(sections, _unpack_tp_sections(packed, shapes, tp_size)):
+        torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+
+
+def test_kda_rejects_projection_indivisible_by_tp():
+    with pytest.raises(ValueError, match="divisible"):
+        _pack_tp_sections([torch.zeros(3, 2), torch.zeros(5, 2)], 2)
+    with pytest.raises(ValueError, match="Invalid KDA split shapes"):
+        _unpack_tp_sections(torch.zeros(8, 2), (3, 5), 2)
+
+
+@pytest.mark.parametrize("bias", [True, False, None])
+def test_kda_gate_bias_mapping_follows_config(bias):
+    registry = build_apertus2_mapping_registry(_schedule_config(linear_attn_output_gate_bias=bias))
+    assert (registry.megatron_to_hf_lookup("decoder.layers.0.self_attention.gate_out_proj.bias") is not None) == (
+        bias is not False
+    )
 
 
 def test_kda_in_proj_export_splits_globally_gathered_weight(monkeypatch):

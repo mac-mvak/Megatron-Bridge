@@ -78,6 +78,12 @@ def build_apertus2_spec(config, vp_stage=None):
             submodules = cast(Any, layer_spec.submodules)
             submodules.input_layernorm = IdentityOp
             submodules.self_attention = get_kimi_delta_attention_module_spec(config)
+            # These affect the checkpoint schema, so config must take precedence over
+            # MCore's legacy environment defaults. Keep the other projections bias-free.
+            submodules.self_attention.params.update(
+                a_log_per_channel=getattr(config, "linear_attn_a_log_per_channel", False),
+                output_gate_bias=getattr(config, "linear_attn_output_gate_bias", True),
+            )
         layer_specs[local_idx] = layer_spec
     return block_spec
 

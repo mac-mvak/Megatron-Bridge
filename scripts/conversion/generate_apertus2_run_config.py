@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from megatron.core.activations import sssglu_act
+from megatron.core.dist_checkpointing import load_tensors_metadata
 from transformers import PretrainedConfig
 
 from megatron.bridge.models.apertus2.apertus2_bridge import Apertus2Bridge
@@ -57,6 +58,34 @@ class _LegacyConfigView:
         raise AttributeError(name)
 
 
+def _infer_kda_checkpoint_flags(hf_config: dict[str, Any], metadata: dict[str, Any]) -> dict[str, bool]:
+    """Recover environment-only KDA options from every layer's tensor metadata."""
+    layers = [index for index, kind in enumerate(hf_config["layer_types"]) if kind == "linear_attention"]
+    if not layers:
+        return {}
+    heads = hf_config["linear_num_value_heads"]
+    channels = heads * hf_config["linear_key_head_dim"]
+    layouts = set()
+    biases = set()
+    for index in layers:
+        prefix = f"decoder.layers.{index}.self_attention"
+        key = f"{prefix}.A_log"
+        entry = metadata.get(key)
+        shape = tuple(entry.global_shape) if entry is not None else None
+        if shape not in ((heads,), (channels,)):
+            raise ValueError(f"{key}: expected A_log shape {(heads,)} or {(channels,)}, got {shape}")
+        layouts.add(shape)
+        biases.add(f"{prefix}.gate_out_proj.bias" in metadata)
+    if len(layouts) != 1:
+        raise ValueError("Mixed KDA A_log layouts cannot be represented by one HF config")
+    if len(biases) != 1:
+        raise ValueError("Mixed KDA output-gate bias presence cannot be represented by one HF config")
+    return {
+        "linear_attn_a_log_per_channel": layouts == {(channels,)} and channels != heads,
+        "linear_attn_output_gate_bias": biases == {True},
+    }
+
+
 def _validate_generated_config(candidate_dir: Path, expected: Any) -> None:
     loaded, legacy_args = load_model_config(str(candidate_dir))
     if legacy_args is not None:
@@ -72,6 +101,8 @@ def _validate_generated_config(candidate_dir: Path, expected: Any) -> None:
         "linear_attention_freq",
         "moe_layer_freq",
         "no_rope_freq",
+        "linear_attn_a_log_per_channel",
+        "linear_attn_output_gate_bias",
     )
     mismatches = {
         name: (getattr(expected, name, None), getattr(loaded, name, None))
@@ -105,6 +136,7 @@ def generate_run_config(checkpoint: Path, output: Path, *, overwrite: bool = Fal
     transformer_config.activation_func = sssglu_act
 
     hf_dict = Apertus2Bridge.megatron_to_hf_config(_LegacyConfigView(transformer_config, args))
+    hf_dict.update(_infer_kda_checkpoint_flags(hf_dict, load_tensors_metadata(str(checkpoint))))
     hf_config = PretrainedConfig(**hf_dict)
     provider = AutoBridge.from_hf_config(hf_config).to_megatron_provider(load_weights=False)
     provider.perform_initialization = False

@@ -87,6 +87,7 @@ class Apertus2ModelProvider(GPTModelProvider):
     linear_attention_safe_output_gate_lower_bound: float = -5.0
     linear_attention_output_gate_form: str = "per_channel"
     linear_attn_output_gate_bias: bool = True
+    linear_attn_a_log_per_channel: bool = False
 
 
 __all__ = ["Apertus2ModelProvider"]
