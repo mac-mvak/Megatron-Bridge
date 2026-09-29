@@ -18,16 +18,34 @@
 import os
 from copy import copy, deepcopy
 from dataclasses import dataclass
-from typing import ClassVar, cast
+from functools import partial
+from typing import Callable, ClassVar, cast
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.training.models.gpt import GPTModelBuilder
 
-from megatron.bridge.models.apertus2.apertus2_provider import _validate_kda_a_log_layout
+from megatron.bridge.models.apertus2.apertus2_provider import (
+    _preserve_kda_decay_parameters,
+    _validate_kda_a_log_layout,
+)
 from megatron.bridge.models.apertus2.apertus2_spec import build_apertus2_spec
 from megatron.bridge.models.gpt.model_config import BridgeGPTModelConfig
+from megatron.bridge.models.model_provider import _apply_mixed_precision_wrapper
 from megatron.bridge.models.transformer_config import TransformerConfig
+
+
+def _wrap_preserving_fp32(
+    config: TransformerConfig,
+    model: MegatronModule,
+    *,
+    wrapper: Callable[[TransformerConfig, MegatronModule], MegatronModule],
+) -> MegatronModule:
+    """Use Bridge's precision-preserving wrapper on MCore's builder path too."""
+    return _apply_mixed_precision_wrapper([model], config, wrapper)[0]
 
 
 @dataclass(kw_only=True)
@@ -82,7 +100,38 @@ class Apertus2ModelBuilder(GPTModelBuilder):
             else:
                 os.environ["KDA_ALOG_PER_CHANNEL"] = previous
         _validate_kda_a_log_layout(model, per_channel)
+        _preserve_kda_decay_parameters([model])
         return model
+
+    def build_distributed_models(
+        self,
+        pg_collection: ProcessGroupCollection,
+        ddp_config: DistributedDataParallelConfig | None = None,
+        overlap_param_gather_with_optimizer_step: bool = False,
+        use_megatron_fsdp: bool = False,
+        use_torch_fsdp2: bool = False,
+        wrap_with_ddp: bool = True,
+        data_parallel_random_init: bool = True,
+        mixed_precision_wrapper: Callable[[TransformerConfig, MegatronModule], MegatronModule] | None = Float16Module,
+        model_type: ModelType = ModelType.encoder_or_decoder,
+    ) -> list[GPTModel]:
+        """Build distributed models while preserving KDA and router state in FP32."""
+        wrapper = (
+            partial(_wrap_preserving_fp32, wrapper=mixed_precision_wrapper)
+            if mixed_precision_wrapper is not None
+            else None
+        )
+        return super().build_distributed_models(
+            pg_collection,
+            ddp_config=ddp_config,
+            overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=use_megatron_fsdp,
+            use_torch_fsdp2=use_torch_fsdp2,
+            wrap_with_ddp=wrap_with_ddp,
+            data_parallel_random_init=data_parallel_random_init,
+            mixed_precision_wrapper=wrapper,
+            model_type=model_type,
+        )
 
 
 __all__ = ["Apertus2ModelBuilder", "Apertus2ModelConfig", "Apertus2TransformerConfig"]

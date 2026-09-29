@@ -33,6 +33,23 @@ from megatron.bridge.models.conversion.param_mapping import (
 from megatron.bridge.models.conversion.utils import remove_non_pickleables
 
 
+def _pack_tp_sections(sections: list[torch.Tensor], tp_size: int) -> torch.Tensor:
+    """Arrange independently sharded projections for a contiguous TP scatter."""
+    if any(section.shape[0] % tp_size for section in sections):
+        raise ValueError(f"Every KDA projection must be divisible by TP size {tp_size}")
+    shards = [section.chunk(tp_size, dim=0) for section in sections]
+    return torch.cat([shard[rank] for rank in range(tp_size) for shard in shards], dim=0)
+
+
+def _unpack_tp_sections(fused: torch.Tensor, split_shapes: tuple[int, ...], tp_size: int) -> tuple[torch.Tensor, ...]:
+    """Undo a TP gather of native KDA's locally fused projections."""
+    if sum(split_shapes) != fused.shape[0] or any(size % tp_size for size in split_shapes):
+        raise ValueError(f"Invalid KDA split shapes {split_shapes} for {tuple(fused.shape)} and TP size {tp_size}")
+    local_shapes = [size // tp_size for size in split_shapes]
+    ranks = [torch.split(shard, local_shapes, dim=0) for shard in fused.chunk(tp_size, dim=0)]
+    return tuple(torch.cat([rank[index] for rank in ranks], dim=0) for index in range(len(split_shapes)))
+
+
 class Apertus2QKVGMapping(QKVGMapping):
     """
     Preserve the channelwise attention-output gate used by Apertus2.
@@ -129,7 +146,7 @@ class KDAInProjMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
     def hf_to_megatron(self, hf_weights, megatron_module):
         merged = None
         if self.tp_rank == 0:
-            merged = torch.cat([hf_weights[name] for name in self._names], dim=0)
+            merged = _pack_tp_sections([hf_weights[name] for name in self._names], self.tp_size)
         return self._tp_mapping.hf_to_megatron(cast(torch.Tensor, merged), megatron_module)
 
     def megatron_to_hf(self, megatron_weights, megatron_module):
@@ -143,7 +160,7 @@ class KDAInProjMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
         )
         if split_shapes is None:
             raise ValueError("KDA in_proj.weight is missing kda_split_shapes metadata")
-        sections = torch.split(fused, list(split_shapes), dim=0)
+        sections = _unpack_tp_sections(fused, tuple(split_shapes), self.tp_size)
         if len(sections) != len(self._names):
             raise ValueError(f"KDA in_proj split has {len(sections)} sections, expected 6")
         hf_param = cast(dict[str, str], self.hf_param)
@@ -182,7 +199,7 @@ class KDAConv1dMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
     def hf_to_megatron(self, hf_weights, megatron_module):
         merged = None
         if self.tp_rank == 0:
-            merged = torch.cat([hf_weights[name] for name in self._names], dim=0)
+            merged = _pack_tp_sections([hf_weights[name] for name in self._names], self.tp_size)
         return self._tp_mapping.hf_to_megatron(cast(torch.Tensor, merged), megatron_module)
 
     def megatron_to_hf(self, megatron_weights, megatron_module):
@@ -190,9 +207,40 @@ class KDAConv1dMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
         if not gathered:
             return {}
         fused = next(iter(gathered.values()))
-        sections = torch.split(fused, list(self._sections(megatron_module)), dim=0)
+        sections = _unpack_tp_sections(fused, self._sections(megatron_module), self.tp_size)
         hf_param = cast(dict[str, str], self.hf_param)
         return {hf_param[name]: section for name, section in zip(self._names, sections)}
+
+
+class Apertus2QBMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
+    """Preserve QB thresholds and the HF schema's unused zero correction buffer."""
+
+    def __init__(self, megatron_param: str, *, beta: str, correction: str) -> None:
+        super().__init__(megatron_param, {"beta": beta, "correction": correction})
+        self._tp_mapping = ReplicatedMapping(megatron_param, beta)
+
+    def resolve(self, captures: tuple[str, ...]) -> "Apertus2QBMapping":
+        megatron_param, hf_params = self._resolve_names(captures)
+        return type(self)(megatron_param, **cast(dict[str, str], hf_params))
+
+    def hf_to_megatron(
+        self, hf_weights: dict[str, torch.Tensor] | None, megatron_module: torch.nn.Module | None
+    ) -> torch.Tensor:
+        if hf_weights is not None and torch.count_nonzero(hf_weights["correction"]):
+            raise ValueError("Quantile-balanced Apertus2 requires a zero e_score_correction_bias")
+        beta = hf_weights["beta"] if hf_weights is not None else None
+        return cast(torch.Tensor, self._tp_mapping.hf_to_megatron(beta, megatron_module))
+
+    def megatron_to_hf(
+        self, megatron_weights: torch.Tensor | None, megatron_module: torch.nn.Module | None
+    ) -> dict[str, torch.Tensor]:
+        weights = cast(dict[str, torch.Tensor], self._tp_mapping.megatron_to_hf(megatron_weights, megatron_module))
+        if not weights:
+            return {}
+        hf_params = cast(dict[str, str], self.hf_param)
+        beta = weights[hf_params["beta"]]
+        weights[hf_params["correction"]] = torch.zeros_like(beta, dtype=torch.float32)
+        return weights
 
 
 def _model_mappings(config, *, include_expert_bias: bool) -> MegatronMappingRegistry:
@@ -272,11 +320,12 @@ def _model_mappings(config, *, include_expert_bias: bool) -> MegatronMappingRegi
                     ColumnParallelMapping(f"{attn}.dt_bias", f"{hf_attn}.dt_bias"),
                     ColumnParallelMapping(f"{attn}.decay_out_proj.weight", f"{hf_attn}.f_b_proj.weight"),
                     ColumnParallelMapping(f"{attn}.gate_out_proj.weight", f"{hf_attn}.g_b_proj.weight"),
-                    ColumnParallelMapping(f"{attn}.gate_out_proj.bias", f"{hf_attn}.g_b_proj.bias"),
                     ReplicatedMapping(f"{attn}.out_norm.weight", f"{hf_attn}.o_norm.weight"),
                     RowParallelMapping(f"{attn}.out_proj.weight", f"{hf_attn}.o_proj.weight"),
                 ]
             )
+            if getattr(config, "linear_attn_output_gate_bias", None) is not False:
+                mappings.append(ColumnParallelMapping(f"{attn}.gate_out_proj.bias", f"{hf_attn}.g_b_proj.bias"))
         else:
             qkv_mapping = (
                 Apertus2QKVGMapping(
@@ -382,7 +431,15 @@ def _model_mappings(config, *, include_expert_bias: bool) -> MegatronMappingRegi
                     )
                 )
             if getattr(config, "use_quantile_balancing", False):
-                mappings.append(ReplicatedMapping(f"{layer}.mlp.router.qb_beta", f"{hf_layer}.mlp.gate.qb_beta"))
+                mappings.append(
+                    ReplicatedMapping(f"{layer}.mlp.router.qb_beta", f"{hf_layer}.mlp.gate.qb_beta")
+                    if include_expert_bias
+                    else Apertus2QBMapping(
+                        f"{layer}.mlp.router.qb_beta",
+                        beta=f"{hf_layer}.mlp.gate.qb_beta",
+                        correction=f"{hf_layer}.mlp.gate.e_score_correction_bias",
+                    )
+                )
         else:
             mappings.extend(
                 [

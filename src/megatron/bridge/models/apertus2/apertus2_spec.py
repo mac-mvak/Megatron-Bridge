@@ -18,10 +18,21 @@
 import copy
 from typing import Any, cast
 
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.ssm.kimi_delta_attention import get_kimi_delta_attention_module_spec
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+from megatron.bridge.models.transformer_config import TransformerConfig
+
+
+class _KDAOutputGateLinear(TEColumnParallelLinear):
+    """Apply the HF gate-bias setting without enabling bias on other KDA projections."""
+
+    def __init__(self, *args: Any, config: TransformerConfig, **kwargs: Any) -> None:
+        kwargs["bias"] = config.linear_attn_output_gate_bias
+        super().__init__(*args, config=config, **kwargs)
 
 
 def _attention_layer_types(config) -> tuple[str, ...]:
@@ -78,6 +89,7 @@ def build_apertus2_spec(config, vp_stage=None):
             submodules = cast(Any, layer_spec.submodules)
             submodules.input_layernorm = IdentityOp
             submodules.self_attention = get_kimi_delta_attention_module_spec(config)
+            submodules.self_attention.submodules.gate_out_proj = _KDAOutputGateLinear
         layer_specs[local_idx] = layer_spec
     return block_spec
 

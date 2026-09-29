@@ -187,7 +187,7 @@ class TestApertus2ConfigConversion:
             ]
             is True
         )
-        assert "linear_attn_a_log_per_channel" not in bridge.megatron_to_hf_config(_provider())
+        assert bridge.megatron_to_hf_config(_provider())["linear_attn_a_log_per_channel"] is False
 
     def test_rejects_non_boolean_a_log_layout(self):
         with pytest.raises(ValueError, match="linear_attn_a_log_per_channel must be a boolean"):
