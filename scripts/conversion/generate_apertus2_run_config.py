@@ -72,6 +72,8 @@ def _validate_generated_config(candidate_dir: Path, expected: Any) -> None:
         "linear_attention_freq",
         "moe_layer_freq",
         "no_rope_freq",
+        "linear_attn_a_log_per_channel",
+        "linear_attn_output_gate_bias",
     )
     mismatches = {
         name: (getattr(expected, name, None), getattr(loaded, name, None))

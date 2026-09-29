@@ -15,7 +15,9 @@
 
 """Unit tests for the Apertus2 model bridge."""
 
+import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +25,7 @@ import torch
 from megatron.core.activations import sssglu_act
 from megatron.core.ssm.kimi_delta_attention import KimiDeltaAttention
 from megatron.training.models.gpt import GPTModelBuilder
+from transformers import PretrainedConfig
 
 from megatron.bridge.models.apertus2.apertus2_bridge import Apertus2Bridge
 from megatron.bridge.models.apertus2.apertus2_builder import Apertus2ModelBuilder
@@ -159,6 +162,43 @@ def _provider(**overrides):
 
 @pytest.mark.unit
 class TestApertus2ConfigConversion:
+    @pytest.mark.parametrize("per_channel", [True, False, None])
+    @pytest.mark.parametrize("bias", [True, False, None])
+    def test_kda_flags_roundtrip(self, per_channel, bias):
+        config = _hf_config(linear_attn_a_log_per_channel=per_channel, linear_attn_output_gate_bias=bias)
+        provider_kwargs = Apertus2Bridge().hf_config_to_provider_kwargs(config)
+        builder = Apertus2Bridge().hf_config_to_model_config(config)
+        for converted in (SimpleNamespace(**provider_kwargs), builder.transformer):
+            assert converted.linear_attn_a_log_per_channel is (per_channel is True)
+            assert converted.linear_attn_output_gate_bias is (bias is not False)
+        restored = Apertus2Bridge.megatron_to_hf_config(builder)
+        assert restored["linear_attn_a_log_per_channel"] is (per_channel is True)
+        assert restored["linear_attn_output_gate_bias"] is (bias is not False)
+
+    @pytest.mark.parametrize("field", ["linear_attn_a_log_per_channel", "linear_attn_output_gate_bias"])
+    @pytest.mark.parametrize("value", ["false", 1, 0, []])
+    def test_kda_flags_reject_non_boolean_values(self, field, value):
+        with pytest.raises(ValueError, match=f"{field} must be a boolean"):
+            Apertus2Bridge().hf_config_to_provider_kwargs(_hf_config(**{field: value}))
+
+    def test_megachonk_config_preserves_checkpoint_semantics(self):
+        config = PretrainedConfig(**json.loads((Path(__file__).parent / "fixtures/megachonk_config.json").read_text()))
+        result = Apertus2Bridge().hf_config_to_model_config(config)
+        assert result.num_layers == 61
+        assert result.linear_attention_freq.count(1) == 45
+        assert result.moe_layer_freq == [0] * 3 + [1] * 58
+        assert result.no_rope_freq == [1] * 61
+        assert result.transformer.linear_attn_a_log_per_channel is True
+        assert result.transformer.linear_attn_output_gate_bias is False
+        assert result.linear_key_head_dim == result.linear_value_head_dim == 128
+        assert result.linear_num_key_heads == result.linear_num_value_heads == 64
+        assert result.moe_latent_size == 4096
+        assert result.num_moe_experts == 256
+        assert result.sandwich_norm and result.attention_output_gate
+        assert result.scale_embeddings_by_sqrt_hidden and result.residual_output_scaling
+        assert result.bf16 and result.params_dtype is torch.bfloat16
+        assert result.moe_router_quantile_balancing_method == "histogram"
+
     def test_hf_to_megatron_preserves_apertus2_semantics(self):
         result = Apertus2Bridge().hf_config_to_provider_kwargs(_hf_config())
 
@@ -187,7 +227,7 @@ class TestApertus2ConfigConversion:
             ]
             is True
         )
-        assert "linear_attn_a_log_per_channel" not in bridge.megatron_to_hf_config(_provider())
+        assert bridge.megatron_to_hf_config(_provider())["linear_attn_a_log_per_channel"] is False
 
     def test_rejects_non_boolean_a_log_layout(self):
         with pytest.raises(ValueError, match="linear_attn_a_log_per_channel must be a boolean"):
@@ -298,6 +338,42 @@ class TestApertus2ConfigConversion:
 
 @pytest.mark.unit
 class TestApertus2MixedPrecision:
+    @pytest.mark.parametrize("construction", ["provider", "builder"])
+    def test_fp32_router_and_decay_values_survive_wrapping(self, construction):
+        from megatron.bridge.models.apertus2.apertus2_builder import _wrap_preserving_fp32
+        from megatron.bridge.models.model_provider import _apply_mixed_precision_wrapper
+
+        class Router(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("qb_beta", torch.tensor([-0.1234567, 0.2345678]))
+                self.register_buffer("expert_bias", torch.tensor([0.01234567, -0.02345678]))
+
+            def _maintain_float32_expert_bias(self):
+                self.qb_beta = self.qb_beta.float()
+                self.expert_bias = self.expert_bias.float()
+
+        model = Router()
+        module = KimiDeltaAttention.__new__(KimiDeltaAttention)
+        torch.nn.Module.__init__(module)
+        values = torch.tensor([0.1234567, -0.2345678])
+        module.A_log = torch.nn.Parameter(values.clone())
+        module.dt_bias = torch.nn.Parameter(values.clone())
+        model.add_module("kda", module)
+        _preserve_kda_decay_parameters([model])
+        expected = {name: value.clone() for name, value in model.state_dict().items()}
+        config = SimpleNamespace(bf16=True, fp16=False)
+
+        def wrapper(config, model):
+            return model.bfloat16()
+
+        if construction == "provider":
+            _apply_mixed_precision_wrapper([model], config, wrapper)
+        else:
+            _wrap_preserving_fp32(config, model, wrapper=wrapper)
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+
     @pytest.mark.parametrize("per_channel", [False, True])
     def test_provider_uses_requested_a_log_layout_during_build(self, monkeypatch, per_channel):
         monkeypatch.setenv("KDA_ALOG_PER_CHANNEL", "previous")

@@ -34,6 +34,21 @@ def _load_args_from_checkpoint(checkpoint_path: str) -> argparse.Namespace:
 
     args = state_dict["args"]
 
+    if getattr(args, "sssglu", False) and getattr(args, "experimental_attention_variant", None) == "kda":
+        from megatron.bridge.models.apertus2.apertus2_checkpoint import infer_kda_checkpoint_flags
+        from megatron.bridge.models.apertus2.apertus2_spec import _attention_layer_types
+
+        # These options were historically environment-only or implicit in the KDA
+        # constructor. Infer them before the provider is reconstructed from args.
+        flags = infer_kda_checkpoint_flags(
+            dist_checkpointing.load_tensors_metadata(checkpoint_path),
+            layer_types=_attention_layer_types(args),
+            num_value_heads=args.linear_num_value_heads,
+            key_head_dim=args.linear_key_head_dim,
+        )
+        for name, value in flags.items():
+            setattr(args, name, value)
+
     # Backward compat: old checkpoints used hybrid_override_pattern; new ones use
     # hybrid_layer_pattern. Mirror the conversion done in MCore's load_args_from_checkpoint.
     if (
