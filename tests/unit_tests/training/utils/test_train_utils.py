@@ -2894,6 +2894,7 @@ class TestCalcParamsL2Norm:
     @mock.patch("megatron.core.parallel_state.get_expert_tensor_model_pipeline_parallel_group")
     @mock.patch("torch.distributed.get_process_group_ranks")
     @mock.patch("torch.distributed.all_reduce")
+    @pytest.mark.parametrize("has_gtp_groups", [True, False])
     def test_single_model_fp32(
         self,
         mock_all_reduce,
@@ -2906,8 +2907,13 @@ class TestCalcParamsL2Norm:
         mock_get_dp_group_if_dtensor,
         simple_model,
         mock_model_config_fp32,
+        _patch_pg_collection,
+        has_gtp_groups,
     ):
         """Test calc_params_l2_norm with a single model in FP32 mode."""
+        if not has_gtp_groups:
+            del _patch_pg_collection.gtp_remat
+            del _patch_pg_collection.expt_gtp_remat
         # Setup mocks
         mock_get_dp_group_if_dtensor.return_value = None
         mock_is_not_tp_dup.return_value = True
@@ -3361,17 +3367,8 @@ class TestCalcParamsL2Norm:
         assert actual_norm == pytest.approx(2.0)
 
     def test_real_mcore_duplicate_filter_honors_expert_tp_group(self):
-        """Guard the Bridge<->MCore contract for expert-parameter duplicate filtering.
-
-        ``calc_params_l2_norm`` calls MCore's ``param_is_not_tensor_parallel_duplicate`` with an
-        ``expert_tp_group`` so that ``allreduce=False`` expert parameters de-duplicate over expert
-        tensor parallel instead of regular TP. Every other test in this class mocks that function,
-        so they would still pass against an MCore build that dropped the ``expert_tp_group`` kwarg --
-        silently undercounting expert parameter norms. Exercise the real function here so a pinned
-        MCore that regresses below this contract fails loudly (``TypeError`` or wrong result) rather
-        than degrading the training-log norm in production.
-        """
-        from megatron.core.tensor_parallel.layers import param_is_not_tensor_parallel_duplicate
+        """Check real MCore filtering through Bridge for both MCore group signatures."""
+        from megatron.bridge.training.utils.train_utils import param_is_not_tensor_parallel_duplicate
 
         assert "expert_tp_group" in inspect.signature(param_is_not_tensor_parallel_duplicate).parameters
 

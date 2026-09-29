@@ -85,7 +85,20 @@ def setup_optimizer(
                 f"applied {len(mup_overrides)} optimizer param-group override(s)."
             )
 
-    if hasattr(optimizer_config, "provide"):
+    if optimizer_config.optimizer == "md_decoupling":
+        # MDDecoupling has its own parameter partitioning and cannot use the
+        # generic optimizer factory (which would flatten matrix parameters).
+        from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+
+        optimizer = get_megatron_mddecoupling_optimizer(
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=use_gloo_process_groups,
+            layer_wise_distributed_optimizer=optimizer_config.use_layer_wise_distributed_optimizer,
+            pg_collection=pg_collection,
+        )
+    elif hasattr(optimizer_config, "provide"):
         optimizer = optimizer_config.provide(
             model_chunks=model,
             config_overrides=config_overrides,
@@ -277,7 +290,11 @@ def memory_efficient_fp32_optimizer_state_loading(
                 continue
             if not hasattr(distributed_optimizer, "shard_fp32_from_float16_groups"):
                 continue
-            if getattr(getattr(distributed_optimizer, "ddp_config", None), "use_megatron_fsdp", False):
+            if getattr(
+                getattr(distributed_optimizer, "ddp_config", None),
+                "use_megatron_fsdp",
+                False,
+            ):
                 continue
 
             config = getattr(distributed_optimizer, "config", None)
@@ -318,7 +335,11 @@ def memory_efficient_fp32_optimizer_state_loading(
                 torch.optim.Optimizer.load_state_dict(fused_adam, state_dict)
 
             previous_instance_method = inner.__dict__.get("load_state_dict", missing_method)
-            setattr(inner, "load_state_dict", MethodType(_load_state_dict_without_fp32_reallocation, inner))
+            setattr(
+                inner,
+                "load_state_dict",
+                MethodType(_load_state_dict_without_fp32_reallocation, inner),
+            )
             patched.append((inner, previous_instance_method))
 
         if patched:
@@ -341,7 +362,9 @@ def memory_efficient_fp32_optimizer_state_loading(
             torch.cuda.empty_cache()
 
 
-def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer | None) -> bool:
+def sync_hybrid_device_optimizer_fp32_master_copies(
+    optimizer: MegatronOptimizer | None,
+) -> bool:
     """Refresh ``HybridDeviceOptimizer`` FP32 master copies from BF16 model parameters.
 
     Workaround for an upstream Megatron-Core gap: when a checkpoint is loaded
@@ -374,7 +397,9 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
         return False
 
     try:
-        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+            HybridDeviceOptimizer,
+        )
     except ImportError:
         return False
 
@@ -424,7 +449,9 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
 
 
 def _get_scheduler(
-    optimizer_config: OptimizerConfig, scheduler_config: SchedulerConfig, optimizer: MegatronOptimizer
+    optimizer_config: OptimizerConfig,
+    scheduler_config: SchedulerConfig,
+    optimizer: MegatronOptimizer,
 ) -> OptimizerParamScheduler:
     """Get the optimizer parameter scheduler.
 

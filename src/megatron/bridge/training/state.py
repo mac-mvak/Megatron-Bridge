@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.timers import Timers
@@ -39,7 +38,15 @@ from megatron.bridge.training.utils.sig_utils import DistributedSignalHandler
 from megatron.bridge.utils.common_utils import get_rank_safe, get_world_size_safe
 
 
-HAVE_NVRX = has_nvrx_async_support()
+try:
+    from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+except ModuleNotFoundError as error:
+    if error.name != "megatron.core.dist_checkpointing.strategies.nvrx":
+        raise
+    # Older MCore versions expose the same capability probe in the Torch strategy.
+    from megatron.core.dist_checkpointing.strategies.torch import HAVE_NVRX
+else:
+    HAVE_NVRX = has_nvrx_async_support()
 
 
 @dataclass

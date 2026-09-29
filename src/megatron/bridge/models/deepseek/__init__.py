@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from megatron.bridge.models.deepseek.deepseek_v2_bridge import DeepSeekV2Bridge  # noqa: F401
-from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge  # noqa: F401
-from megatron.bridge.models.deepseek.deepseek_v4_bridge import DeepSeekV4Bridge  # noqa: F401
+from importlib.util import find_spec
 
 
-__all__ = [
-    "DeepSeekV2Bridge",
-    "DeepSeekV3Bridge",
-    "DeepSeekV4Bridge",
-]
+# TODO: Remove this guard when the Apertus2 MCore fork provides the MLA QK-norm resolver.
+# Other model families import deepseek.common without requiring DeepSeek model classes.
+DEEPSEEK_AVAILABLE = find_spec("megatron.core.transformer.mla_qk_norm_config") is not None
+
+if DEEPSEEK_AVAILABLE:
+    from megatron.bridge.models.deepseek.deepseek_v2_bridge import DeepSeekV2Bridge
+    from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
+    from megatron.bridge.models.deepseek.deepseek_v4_bridge import DeepSeekV4Bridge
+
+    __all__ = ["DeepSeekV2Bridge", "DeepSeekV3Bridge", "DeepSeekV4Bridge"]
+else:
+    __all__ = []

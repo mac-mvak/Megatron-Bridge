@@ -24,6 +24,7 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 import torch
+from megatron.core import fp8_utils
 
 from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
@@ -322,10 +323,11 @@ def test_qkv_native_mxfp8_gqa_preserves_row_order(monkeypatch, tp_size, packed_r
     local_config = SimpleNamespace(**vars(config))
     local_config.num_attention_heads //= tp_size
     local_config.num_query_groups //= tp_size
-    expected_weights = split_qkv_weights(local_config, weight, feature_dim=64)
+    expected_weights = split_qkv_weights(local_config, weight.view(torch.uint8).to(torch.int16), feature_dim=64)
     expected_scales = split_qkv_weights(local_config, scale, feature_dim=2)
     for param, expected_weight, expected_scale in zip(params, expected_weights, expected_scales):
-        assert torch.equal(param.weight.view(torch.uint8), expected_weight.view(torch.uint8))
+        assert param.weight.dtype == torch.float8_e4m3fn
+        assert torch.equal(param.weight.view(torch.uint8), expected_weight.to(torch.uint8))
         assert torch.equal(param.weight_scale, expected_scale)
 
 
@@ -362,10 +364,11 @@ def test_qkv_native_mxfp8_output_gate_preserves_qz_row_order(monkeypatch, tp_siz
     local_config = SimpleNamespace(**vars(config))
     local_config.num_attention_heads //= tp_size
     local_config.num_query_groups //= tp_size
-    expected_weights = split_qkv_weights(local_config, weight, feature_dim=64)
+    expected_weights = split_qkv_weights(local_config, weight.view(torch.uint8).to(torch.int16), feature_dim=64)
     expected_scales = split_qkv_weights(local_config, scale, feature_dim=2)
     for param, expected_weight, expected_scale in zip(params, expected_weights, expected_scales):
-        assert torch.equal(param.weight.view(torch.uint8), expected_weight.view(torch.uint8))
+        assert param.weight.dtype == torch.float8_e4m3fn
+        assert torch.equal(param.weight.view(torch.uint8), expected_weight.to(torch.uint8))
         assert torch.equal(param.weight_scale, expected_scale)
 
 
@@ -405,10 +408,11 @@ def test_qkv_native_mxfp8_mha_preserves_row_order(monkeypatch, tp_size, packed_r
     local_config = SimpleNamespace(**vars(config))
     local_config.num_attention_heads //= tp_size
     local_config.num_query_groups //= tp_size
-    expected_weights = split_qkv_weights(local_config, weight, feature_dim=64)
+    expected_weights = split_qkv_weights(local_config, weight.view(torch.uint8).to(torch.int16), feature_dim=64)
     expected_scales = split_qkv_weights(local_config, scale, feature_dim=2)
     for param, expected_weight, expected_scale in zip(params, expected_weights, expected_scales):
-        assert torch.equal(param.weight.view(torch.uint8), expected_weight.view(torch.uint8))
+        assert param.weight.dtype == torch.float8_e4m3fn
+        assert torch.equal(param.weight.view(torch.uint8), expected_weight.to(torch.uint8))
         assert torch.equal(param.weight_scale, expected_scale)
 
 
@@ -1106,7 +1110,8 @@ class TestFp8ParamExport:
         with pytest.raises(ValueError, match=rf"{global_name}.*DTensor/FSDP"):
             list(bridge.iter_local_mxfp8_params([task]))
 
-    def test_native_mxfp8_materialization_wraps_grouped_cache_errors(self, monkeypatch):
+    @pytest.mark.parametrize("has_member_helper", [True, False])
+    def test_native_mxfp8_materialization_wraps_grouped_cache_errors(self, monkeypatch, has_member_helper):
         bridge = DummyBridge()
         global_name = "decoder.layers.0.mlp.experts.linear_fc2.weight"
         grouped = torch.nn.Parameter(torch.zeros(2, 8, 64))
@@ -1117,7 +1122,10 @@ class TestFp8ParamExport:
             assert create_if_missing is False
             raise RuntimeError("cached members are unavailable")
 
-        monkeypatch.setattr(f"{_QUANT_MB}.get_grouped_quantized_members", missing_cache)
+        if has_member_helper:
+            monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", missing_cache, raising=False)
+        else:
+            monkeypatch.delattr(fp8_utils, "get_grouped_quantized_members", raising=False)
         task = WeightConversionTask(
             param_name=global_name,
             global_param_name=global_name,
@@ -1126,8 +1134,10 @@ class TestFp8ParamExport:
             param_weight=grouped,
         )
 
-        with pytest.raises(ValueError, match=rf"{global_name}.*cached grouped MXFP8 members"):
+        with pytest.raises(ValueError, match=rf"{global_name}.*cached grouped MXFP8 members") as error:
             list(bridge.iter_local_mxfp8_params([task]))
+        if not has_member_helper:
+            assert "requires MCore grouped quantization helpers" in str(error.value.__cause__)
 
     def test_native_mxfp8_materialization_rejects_inherited_specialized_mapping(self, monkeypatch):
         bridge = DummyBridge()
@@ -1838,7 +1848,8 @@ class TestFp8ParamExport:
         assert tasks[1].param_weight is native_grouped_weight
         assert grouped_member_calls == [(native_grouped_weight, True)]
 
-    def test_build_export_mxfp8_tasks_expands_bf16_grouped_members(self, monkeypatch):
+    @pytest.mark.parametrize("has_grouped_helpers", [True, False])
+    def test_build_export_mxfp8_tasks_expands_bf16_grouped_members(self, monkeypatch, has_grouped_helpers):
         bridge = DummyBridge()
         grouped = "decoder.layers.0.mlp.experts.linear_fc1.weight"
         members = torch.arange(2 * 8 * 16, dtype=torch.bfloat16).view(2, 8, 16)
@@ -1879,7 +1890,11 @@ class TestFp8ParamExport:
             f"{_MODEL_MB}.get_module_and_param_from_name",
             lambda *_args: (SimpleNamespace(config=config), parameter),
         )
-        monkeypatch.setattr(f"{_QUANT_MB}.is_grouped_mxfp8tensor", lambda _weight: False)
+        if has_grouped_helpers:
+            monkeypatch.setattr(fp8_utils, "is_grouped_mxfp8tensor", lambda _weight: False, raising=False)
+        else:
+            monkeypatch.delattr(fp8_utils, "is_grouped_mxfp8tensor", raising=False)
+            monkeypatch.delattr(fp8_utils, "get_grouped_quantized_members", raising=False)
         hf_pretrained = SimpleNamespace(config=SimpleNamespace())
 
         tasks = bridge.build_export_mxfp8_tasks(hf_pretrained, [model])

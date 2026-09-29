@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate as _mcore_param_is_not_tp_duplicate
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -178,6 +178,25 @@ MEMORY_KEYS: dict[str, str] = {
 }
 
 
+def param_is_not_tensor_parallel_duplicate(
+    param: torch.Tensor,
+    *,
+    tp_group: "TorchProcessGroup | None" = None,
+    expert_tp_group: "TorchProcessGroup | None" = None,
+) -> bool:
+    """Delegate duplicate filtering to MCore using the parameter's TP group."""
+    if _MCORE_DUPLICATE_FILTER_HAS_EXPERT_TP:
+        return bool(_mcore_param_is_not_tp_duplicate(param, tp_group=tp_group, expert_tp_group=expert_tp_group))
+    # Older MCore accepts one group; select expert TP for routed-expert parameters.
+    group = tp_group if getattr(param, "allreduce", True) else expert_tp_group
+    return bool(_mcore_param_is_not_tp_duplicate(param, tp_group=group))
+
+
+_MCORE_DUPLICATE_FILTER_HAS_EXPERT_TP = (
+    "expert_tp_group" in inspect.signature(_mcore_param_is_not_tp_duplicate).parameters
+)
+
+
 def param_is_not_shared(param: nn.Parameter) -> bool:
     """Check if a parameter is marked as not shared.
 
@@ -237,8 +256,8 @@ def calc_params_l2_norm(
     sharded_moe_params_data = []
     data_parallel_group = None
     pg_collection = get_pg_collection(model)
-    gtp_rank = get_pg_rank(pg_collection.gtp_remat)
-    expert_gtp_group = pg_collection.expt_gtp_remat
+    gtp_rank = get_pg_rank(getattr(pg_collection, "gtp_remat", None))
+    expert_gtp_group = getattr(pg_collection, "expt_gtp_remat", None)
     expert_gtp_rank = get_pg_rank(expert_gtp_group)
 
     for model_chunk in model:

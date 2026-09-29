@@ -23,6 +23,8 @@ from megatron.core.transformer.module import MegatronModule
 from rich.table import Table
 from transformers.configuration_utils import PretrainedConfig
 
+from megatron.bridge.utils.import_utils import get_mcore_fsdp_types
+
 
 def mcore_to_hf_window_size(window_size: int | list[int] | tuple[int, int] | None) -> int | None:
     """Convert an MCore inclusive attention window to the Hugging Face token count.
@@ -46,21 +48,15 @@ def unwrap_model(model, module_instances=None):
     if module_instances is None:
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-            FullyShardedDataParallelV1,
-            FullyShardedDataParallelV2,
-        )
         from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
         from megatron.core.transformer.module import Float16Module
 
         module_instances = (
             DDP,
             torch_FSDP,
-            FullyShardedDataParallelV1,
-            FullyShardedDataParallelV2,
             Float16Module,
             MegatronFSDP,
-        )
+        ) + get_mcore_fsdp_types()
 
     return_list = True
     if not isinstance(model, list):

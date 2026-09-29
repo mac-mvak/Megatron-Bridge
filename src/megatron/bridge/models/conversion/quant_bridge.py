@@ -15,10 +15,24 @@
 import itertools
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, List, Mapping, Optional, Tuple, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import torch
-from megatron.core.fp8_utils import get_grouped_quantized_members, is_grouped_mxfp8tensor, is_mxfp8tensor  # noqa: F401
+from megatron.core import fp8_utils
+from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 
@@ -30,6 +44,25 @@ if TYPE_CHECKING:
 
 MegatronModel = TypeVar("MegatronModel", bound=MegatronModule)
 HFPreTrained = TypeVar("HFPreTrained")
+
+
+def is_grouped_mxfp8tensor(tensor: torch.Tensor) -> bool:
+    """Check for grouped MXFP8 storage when the installed MCore supports it.
+
+    Older MCore versions do not create this storage type, but still support
+    ordinary BF16 and non-grouped MXFP8 conversion.
+    """
+    check = getattr(fp8_utils, "is_grouped_mxfp8tensor", None)
+    return check is not None and bool(check(tensor))
+
+
+def get_grouped_quantized_members(tensor: torch.Tensor, *, create_if_missing: bool) -> Iterable[torch.Tensor] | None:
+    """Delegate grouped storage access to MCore, requiring its native helper."""
+    get_members = getattr(fp8_utils, "get_grouped_quantized_members", None)
+    if get_members is None:
+        raise RuntimeError("Grouped MXFP8 export requires MCore grouped quantization helpers")
+    # The optional MCore API cannot be statically imported on older versions.
+    return cast(Iterable[torch.Tensor] | None, get_members(tensor, create_if_missing=create_if_missing))
 
 
 @dataclass(frozen=True)

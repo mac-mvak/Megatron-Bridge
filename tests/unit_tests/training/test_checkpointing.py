@@ -15,10 +15,12 @@
 
 import os
 import pickle
+import sys
 import tempfile
 from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, Mock, mock_open, patch
 
 import numpy as np
@@ -27,7 +29,6 @@ import torch
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.msc_utils import MultiStorageClientFeature
-from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
 
 from megatron.bridge.training.checkpointing import (
     _DIRECT_ITERATION_DIR_SENTINEL,
@@ -52,6 +53,7 @@ from megatron.bridge.training.checkpointing import (
     _load_hf_pretrained_checkpoint,
     _load_model_state_dict,
     _load_non_persistent_base_checkpoint,
+    _model_sharded_state_dict_metadata,
     _record_dataloader_state_dir,
     _save_hf_adapter_weights,
     _save_hf_weights,
@@ -3146,6 +3148,28 @@ class TestRecordDataloaderStateDir:
         _record_dataloader_state_dir(None, "/ckpt")
 
 
+class TestLegacyModelShardedStateDictMetadata:
+    """Test legacy offloaded-expert checkpoint metadata recovery."""
+
+    def test_marks_precanonical_offloaded_experts(self):
+        checkpoint_args = Mock(moe_use_offloading_experts=True)
+
+        metadata = _model_sharded_state_dict_metadata({"args": checkpoint_args}, None)
+
+        assert metadata == {
+            "moe_expert_checkpoint_schema": "legacy_offloading",
+            "moe_expert_checkpoint_has_te_extra_state": False,
+        }
+
+    def test_preserves_explicit_checkpoint_schema(self):
+        checkpoint_args = Mock(moe_use_offloading_experts=True)
+        saved_metadata = {"moe_expert_checkpoint_schema": "sequential"}
+
+        metadata = _model_sharded_state_dict_metadata({"args": checkpoint_args}, saved_metadata)
+
+        assert metadata == saved_metadata
+
+
 class TestLoadModelWeightsFromCheckpoint:
     """Test the _load_model_weights_from_checkpoint function."""
 
@@ -3506,7 +3530,19 @@ class TestLoadModelStateDictHelper:
 
     @pytest.fixture(autouse=True)
     def _disable_gtp_load_context(self, monkeypatch):
-        monkeypatch.setattr("megatron.core.tensor_parallel.gtp_api.HAVE_GTP", False)
+        gtp_api = ModuleType("megatron.core.tensor_parallel.gtp_api")
+        monkeypatch.setattr(gtp_api, "HAVE_GTP", False, raising=False)
+        monkeypatch.setitem(sys.modules, gtp_api.__name__, gtp_api)
+
+    def test_load_model_state_dict_without_gtp_module(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel.gtp_api", None)
+        module = torch.nn.Linear(4, 2)
+        expected = {name: torch.ones_like(value) for name, value in module.state_dict().items()}
+
+        _load_model_state_dict(module, expected, strict=True)
+
+        for name, value in module.state_dict().items():
+            torch.testing.assert_close(value, expected[name])
 
     @patch("megatron.core.tensor_parallel.gtp_api.gtp_native_fp8_load_context", create=True)
     @patch("megatron.core.tensor_parallel.gtp_api.HAVE_GTP", True)
@@ -6309,6 +6345,7 @@ class TestAsyncCheckpointScheduling:
 
     def test_schedule_async_save_forwards_nvrx_request(self):
         """The NVRx queue must ignore the inherited stale strategy value."""
+        NVRxAsyncRequest = pytest.importorskip("nvidia_resiliency_ext.checkpointing.async_ckpt.core").AsyncRequest
         async_queue = Mock()
         state = Mock()
         state.async_calls_queue = async_queue

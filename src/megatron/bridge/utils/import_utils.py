@@ -415,6 +415,29 @@ def get_torch_version():
     return _torch_version
 
 
+def get_mcore_fsdp_types(*, version: int | None = None) -> tuple[type[torch.nn.Module], ...]:
+    """Return the available MCore FSDP adapter classes for instance checks.
+
+    Args:
+        version: Select V1 (including its legacy name), V2, or all versions.
+
+    Returns:
+        Available adapter types, or an empty tuple for an unavailable version.
+    """
+    from megatron.core.distributed.fsdp import mcore_fsdp_adapter
+
+    names: dict[int | None, tuple[str, ...]] = {
+        None: ("FullyShardedDataParallel", "FullyShardedDataParallelV1", "FullyShardedDataParallelV2"),
+        1: ("FullyShardedDataParallel", "FullyShardedDataParallelV1"),
+        2: ("FullyShardedDataParallelV2",),
+    }
+    if version not in names:
+        raise ValueError(f"Unsupported MCore FSDP version: {version}")
+    return tuple(
+        adapter for name in names[version] if isinstance(adapter := getattr(mcore_fsdp_adapter, name, None), type)
+    )
+
+
 def is_torch_min_version(version, check_equality=True):
     """Check if minimum version of `torch` is installed."""
     if check_equality:

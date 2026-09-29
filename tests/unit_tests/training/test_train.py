@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 from megatron.bridge.training.state import GlobalState
@@ -43,6 +42,7 @@ from megatron.bridge.training.train import (
     train_step,
 )
 from megatron.bridge.training.utils.train_utils import maybe_inject_state
+from megatron.bridge.utils.import_utils import get_mcore_fsdp_types
 
 
 pytestmark = pytest.mark.unit
@@ -312,7 +312,7 @@ class TestFSDPRegistration:
         config.ddp.fsdp_manual_registration = True
 
         # Mock model chunk
-        model_chunk = Mock(spec=FullyShardedDataParallelV1)
+        model_chunk = Mock(spec=get_mcore_fsdp_types(version=1)[0])
         # Mock ddp_config on the chunk
         model_chunk.ddp_config = Mock()
         model_chunk.ddp_config.fsdp_manual_registration = True

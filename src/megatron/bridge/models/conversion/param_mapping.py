@@ -2135,7 +2135,12 @@ class QKVMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
                 attention_output_gate=getattr(config, "attention_output_gate", False),
             ),
         )
-        qkv_weights = split_qkv_weights(local_config, weight, feature_dim=weight.shape[-1])
+        # CPU advanced indexing does not support float8. Reorder its bytes so
+        # native MXFP8 payloads remain exact without dequantization.
+        qkv_weights = tuple(
+            component.view(weight.dtype)
+            for component in split_qkv_weights(local_config, weight.view(torch.uint8), feature_dim=weight.shape[-1])
+        )
         qkv_scales = split_qkv_weights(local_config, weight_scale, feature_dim=weight_scale.shape[-1])
         names = (self.hf_param["q"], self.hf_param["k"], self.hf_param["v"])
 
