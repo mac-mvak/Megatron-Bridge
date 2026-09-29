@@ -349,6 +349,7 @@ class TestApertus2MixedPrecision:
         provider = Apertus2ModelProvider()
 
         assert _preserve_kda_decay_parameters in provider._pre_wrap_hooks
+        assert provider.kda_legacy_gate_out_proj_bias is True
 
     def test_preserves_kda_decay_parameters_in_fp32(self):
         module = KimiDeltaAttention.__new__(KimiDeltaAttention)
