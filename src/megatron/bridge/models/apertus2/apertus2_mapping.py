@@ -212,38 +212,7 @@ class KDAConv1dMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
         return {hf_param[name]: section for name, section in zip(self._names, sections)}
 
 
-class Apertus2QBMapping(MegatronParamMapping[dict[str, torch.Tensor]]):
-    """Preserve QB thresholds and the HF schema's unused zero correction buffer."""
-
-    def __init__(self, megatron_param: str, *, beta: str, correction: str) -> None:
-        super().__init__(megatron_param, {"beta": beta, "correction": correction})
-        self._tp_mapping = ReplicatedMapping(megatron_param, beta)
-
-    def resolve(self, captures: tuple[str, ...]) -> "Apertus2QBMapping":
-        megatron_param, hf_params = self._resolve_names(captures)
-        return type(self)(megatron_param, **cast(dict[str, str], hf_params))
-
-    def hf_to_megatron(
-        self, hf_weights: dict[str, torch.Tensor] | None, megatron_module: torch.nn.Module | None
-    ) -> torch.Tensor:
-        if hf_weights is not None and torch.count_nonzero(hf_weights["correction"]):
-            raise ValueError("Quantile-balanced Apertus2 requires a zero e_score_correction_bias")
-        beta = hf_weights["beta"] if hf_weights is not None else None
-        return cast(torch.Tensor, self._tp_mapping.hf_to_megatron(beta, megatron_module))
-
-    def megatron_to_hf(
-        self, megatron_weights: torch.Tensor | None, megatron_module: torch.nn.Module | None
-    ) -> dict[str, torch.Tensor]:
-        weights = cast(dict[str, torch.Tensor], self._tp_mapping.megatron_to_hf(megatron_weights, megatron_module))
-        if not weights:
-            return {}
-        hf_params = cast(dict[str, str], self.hf_param)
-        beta = weights[hf_params["beta"]]
-        weights[hf_params["correction"]] = torch.zeros_like(beta, dtype=torch.float32)
-        return weights
-
-
-def _model_mappings(config, *, include_expert_bias: bool) -> MegatronMappingRegistry:
+def _model_mappings(config) -> MegatronMappingRegistry:
     """Build mappings for the actual per-layer schedules in ``config``."""
     num_layers = int(config.num_hidden_layers)
     layer_types = tuple(getattr(config, "layer_types", None) or ("full_attention",) * num_layers)
@@ -423,23 +392,7 @@ def _model_mappings(config, *, include_expert_bias: bool) -> MegatronMappingRegi
                     ),
                 ]
             )
-            if include_expert_bias:
-                mappings.append(
-                    ReplicatedMapping(
-                        f"{layer}.mlp.router.expert_bias",
-                        f"{hf_layer}.mlp.gate.e_score_correction_bias",
-                    )
-                )
-            if getattr(config, "use_quantile_balancing", False):
-                mappings.append(
-                    ReplicatedMapping(f"{layer}.mlp.router.qb_beta", f"{hf_layer}.mlp.gate.qb_beta")
-                    if include_expert_bias
-                    else Apertus2QBMapping(
-                        f"{layer}.mlp.router.qb_beta",
-                        beta=f"{hf_layer}.mlp.gate.qb_beta",
-                        correction=f"{hf_layer}.mlp.gate.e_score_correction_bias",
-                    )
-                )
+            mappings.append(ReplicatedMapping(f"{layer}.mlp.router.qb_beta", f"{hf_layer}.mlp.gate.qb_beta"))
         else:
             mappings.extend(
                 [
@@ -484,16 +437,11 @@ def build_apertus2_mapping_registry(config=None) -> MegatronMappingRegistry:
             moe_router_enable_expert_bias = False
 
         config = _Default()
-    return _model_mappings(
-        config,
-        include_expert_bias=bool(
-            getattr(
-                config,
-                "moe_router_enable_expert_bias",
-                not bool(getattr(config, "use_quantile_balancing", False)),
-            )
-        ),
-    )
+    if getattr(config, "use_quantile_balancing", False) is not True:
+        raise ValueError("Apertus2 supports only quantile balancing; use_quantile_balancing must be True")
+    if getattr(config, "moe_router_enable_expert_bias", False):
+        raise ValueError("Apertus2 QB-only conversion requires moe_router_enable_expert_bias=False")
+    return _model_mappings(config)
 
 
 __all__ = ["build_apertus2_mapping_registry"]

@@ -409,7 +409,17 @@ class TestAutoBridge:
 
         assert source.save_generator_kwargs["ignored_source_key_suffixes"] == ("_scale_inv",)
 
-    def _run_save_hf_weights(self, source, tmp_path, *, mtp_num_layers, weight_dtype=None):
+    @pytest.mark.parametrize("weight_dtype", [None, torch.bfloat16])
+    def test_save_hf_weights_omits_retired_model_buffers(self, tmp_path, weight_dtype):
+        source = _make_fake_source(present=set())
+        retired = (".mlp.gate.e_score_correction_bias",)
+        self._run_save_hf_weights(
+            source, tmp_path, mtp_num_layers=1, weight_dtype=weight_dtype, retired_suffixes=retired
+        )
+        expected = retired + (("_scale_inv",) if weight_dtype is not None else ())
+        assert source.save_generator_kwargs["ignored_source_key_suffixes"] == expected
+
+    def _run_save_hf_weights(self, source, tmp_path, *, mtp_num_layers, weight_dtype=None, retired_suffixes=()):
         """Drive ``save_hf_weights`` with a stubbed bridge/model so the only
         behavior under test is the MTP prefix-resolution wiring.
 
@@ -425,7 +435,10 @@ class TestAutoBridge:
         bridge_obj = object.__new__(AutoBridge)
         bridge_obj.hf_pretrained = hf_pretrained
 
-        fake_model_bridge = Mock()
+        class FakeModelBridge(Mock):
+            HF_EXPORT_IGNORED_SOURCE_KEY_SUFFIXES = retired_suffixes
+
+        fake_model_bridge = FakeModelBridge()
         fake_model_bridge.stream_weights_megatron_to_hf.return_value = iter([])
 
         with (

@@ -212,11 +212,33 @@ class TestApertus2ConfigConversion:
         assert result.transformer.linear_attn_output_gate_bias is True
         assert result.transformer_layer_spec is None
 
-    def test_non_qb_routing_enables_static_correction_buffer(self):
-        result = Apertus2Bridge().hf_config_to_provider_kwargs(_hf_config(use_quantile_balancing=False))
+    def test_non_qb_routing_is_rejected(self):
+        with pytest.raises(ValueError, match="only quantile balancing"):
+            Apertus2Bridge().hf_config_to_provider_kwargs(_hf_config(use_quantile_balancing=False))
 
-        assert result["moe_router_load_balancing_type"] == "aux_loss"
-        assert result["moe_router_enable_expert_bias"] is True
+    def test_native_non_qb_checkpoint_is_rejected(self):
+        provider = _provider()
+        provider.moe_router_load_balancing_type = "aux_loss"
+        with pytest.raises(ValueError, match="only quantile balancing"):
+            Apertus2Bridge.megatron_to_hf_config(provider)
+
+    def test_qb_with_native_expert_bias_is_rejected(self):
+        with pytest.raises(ValueError, match="expert_bias=False"):
+            Apertus2Bridge().hf_config_to_provider_kwargs(_hf_config(moe_router_enable_expert_bias=True))
+
+    @pytest.mark.parametrize("correction_value", [None, 0.0, 1.0])
+    def test_old_hf_qb_thresholds_load_only_with_zero_correction(self, correction_value):
+        beta_name = "model.layers.1.mlp.gate.qb_beta"
+        beta = torch.tensor([0.13, -0.7], dtype=torch.float32)
+        state = {beta_name: beta}
+        if correction_value is not None:
+            state["model.layers.1.mlp.gate.e_score_correction_bias"] = torch.full_like(beta, correction_value)
+        bridge = Apertus2Bridge()
+        if correction_value:
+            with pytest.raises(ValueError, match="nonzero legacy correction buffer"):
+                bridge.maybe_modify_loaded_hf_weight(beta_name, state)
+        else:
+            assert torch.equal(bridge.maybe_modify_loaded_hf_weight(beta_name, state), beta)
 
     @pytest.mark.parametrize(
         ("use_qb", "routing"),
@@ -232,7 +254,7 @@ class TestApertus2ConfigConversion:
             moe_router_load_balancing_type=routing,
         )
 
-        with pytest.raises(ValueError, match="use_quantile_balancing must match"):
+        with pytest.raises(ValueError, match="use_quantile_balancing must"):
             Apertus2Bridge().hf_config_to_provider_kwargs(config)
 
     def test_megatron_to_hf_config_is_reloadable(self):
@@ -367,12 +389,9 @@ class TestApertus2MixedPrecision:
 
 @pytest.mark.unit
 class TestApertus2MappingRegistry:
-    def test_non_qb_registry_maps_expert_correction_bias(self):
-        registry = build_apertus2_mapping_registry(_hf_config(use_quantile_balancing=False))
-        megatron_params = {str(mapping.megatron_param) for mapping in registry.mappings}
-
-        assert "decoder.layers.1.mlp.router.expert_bias" in megatron_params
-        assert "decoder.layers.1.mlp.router.qb_beta" not in megatron_params
+    def test_non_qb_registry_is_rejected(self):
+        with pytest.raises(ValueError, match="only quantile balancing"):
+            build_apertus2_mapping_registry(_hf_config(use_quantile_balancing=False))
 
     def test_qb_registry_maps_beta_instead_of_correction_bias(self):
         registry = build_apertus2_mapping_registry(_hf_config())
@@ -380,3 +399,5 @@ class TestApertus2MappingRegistry:
 
         assert "decoder.layers.1.mlp.router.qb_beta" in megatron_params
         assert "decoder.layers.1.mlp.router.expert_bias" not in megatron_params
+        mapping = registry.megatron_to_hf_lookup("decoder.layers.1.mlp.router.qb_beta")
+        assert mapping.hf_param == "model.layers.1.mlp.gate.qb_beta"

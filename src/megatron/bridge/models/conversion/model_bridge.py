@@ -490,6 +490,9 @@ class MegatronModelBridge(
     # for example ``["*reasoning_parser.py"]``.
     ADDITIONAL_FILE_PATTERNS = None
 
+    # Deprecated source-only tensors that this model family no longer exports.
+    HF_EXPORT_IGNORED_SOURCE_KEY_SUFFIXES: ClassVar[tuple[str, ...]] = ()
+
     def postprocess_hf_export_artifacts(self, path: Path) -> None:
         """Apply model-specific fixes after Hugging Face artifacts are saved.
 

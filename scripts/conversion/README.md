@@ -31,6 +31,25 @@ renamed or inserted as `run_config.yaml`.
 
 ## Local CPU conversion
 
+### Apertus2 routing contract
+
+Apertus2 conversion supports quantile balancing only. HF configs must declare
+`use_quantile_balancing=True`; native checkpoint routing must include
+`quantile_balancing`, with `moe_router_enable_expert_bias=False`. Both sigmoid
+and legacy raw-logit QB score spaces are preserved.
+
+The mapping copies FP32 `qb_beta` directly and exports no
+`e_score_correction_bias`. Imports accept the extra correction buffer in old
+QB exports only when it is zero. Streaming exports omit those retired keys
+from the reference shard layout.
+
+Use the QB-only configuration and modeling files from the updated hfconverter
+as the HF reference assets. Bridge copies custom Python code from the supplied
+reference; updating Bridge does not update the code bundled in an existing
+HF export directory.
+
+### Running locally
+
 Local execution uses the current Megatron Bridge environment and waits for the
 conversion to finish.
 

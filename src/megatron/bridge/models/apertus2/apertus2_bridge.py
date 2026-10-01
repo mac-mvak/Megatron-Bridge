@@ -15,6 +15,7 @@
 
 """Hugging Face adapter for the native Apertus2 model family."""
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -32,7 +33,7 @@ from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.transformers_compat import rope_theta_from_hf
 
 
-_FP32_EXPORT_SUFFIXES = (".A_log", ".dt_bias", ".gate.qb_beta", ".gate.e_score_correction_bias")
+_FP32_EXPORT_SUFFIXES = (".A_log", ".dt_bias", ".gate.qb_beta")
 
 
 def _schedule_from_hf(hf_config: Any) -> tuple[str, ...]:
@@ -147,6 +148,7 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
     """Bridge Apertus2 configs while retaining MCore's virtual KDA checkpoint keys."""
 
     MODEL_CONFIG_CLASS = Apertus2ModelConfig
+    HF_EXPORT_IGNORED_SOURCE_KEY_SUFFIXES = (".mlp.gate.e_score_correction_bias",)
 
     def _apertus2_kwargs(self, hf_config: Any) -> dict[str, Any]:
         """Translate all config controls that affect model math or state layout."""
@@ -193,6 +195,10 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
             raise ValueError("Apertus2 attention_bias=True is unsupported by the bias-free checkpoint")
 
         use_qb = bool(getattr(hf_config, "use_quantile_balancing", False))
+        if not use_qb:
+            raise ValueError("Apertus2 supports only quantile balancing; use_quantile_balancing must be True")
+        if getattr(hf_config, "moe_router_enable_expert_bias", False):
+            raise ValueError("Apertus2 QB-only conversion requires moe_router_enable_expert_bias=False")
         qb_method = getattr(hf_config, "moe_router_quantile_balancing_method", "sigmoid")
         qb_method = {"sigmoid": "histogram", "legacy": "legacy_average"}.get(qb_method, qb_method)
         if use_qb and qb_method not in ("average", "legacy_average", "histogram"):
@@ -211,10 +217,8 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
                     "use_quantile_balancing must match moe_router_load_balancing_type; "
                     f"got use_quantile_balancing={use_qb} and {load_balancing_type!r}"
                 )
-        elif use_qb:
-            load_balancing_type = "quantile_balancing"
         else:
-            load_balancing_type = "aux_loss"
+            load_balancing_type = "quantile_balancing"
         if isinstance(load_balancing_type, list):
             coefficients = getattr(hf_config, "moe_aux_loss_coeff", None)
             if coefficients is None:
@@ -269,9 +273,7 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
             "moe_router_pre_softmax": False,
             "moe_router_score_function": "sigmoid",
             "moe_router_dtype": "fp32",
-            # The HF router always carries the correction buffer. Enabling it for
-            # non-QB routing preserves nonzero checkpoints, while an all-zero buffer is inert.
-            "moe_router_enable_expert_bias": bool(getattr(hf_config, "moe_router_enable_expert_bias", not use_qb)),
+            "moe_router_enable_expert_bias": False,
             "moe_router_bias_update_rate": 0.0,
             "moe_router_load_balancing_type": load_balancing_type,
             "moe_aux_loss_coeff": moe_aux_loss_coeff,
@@ -415,6 +417,12 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
         routing = getattr(provider, "moe_router_load_balancing_type", None)
         routing_methods = [routing] if isinstance(routing, str) else list(routing or ())
         use_qb = "quantile_balancing" in routing_methods
+        if not use_qb:
+            raise ValueError(
+                "Apertus2 supports only quantile balancing; checkpoint routing must include quantile_balancing"
+            )
+        if getattr(provider, "moe_router_enable_expert_bias", False):
+            raise ValueError("Apertus2 QB-only conversion requires moe_router_enable_expert_bias=False")
         qb_method = getattr(provider, "moe_router_quantile_balancing_method", "histogram")
         qb_method = {
             "average": "sigmoid",
@@ -521,6 +529,16 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
     def mapping_registry(self) -> MegatronMappingRegistry:
         """Return schedule-specific virtual-key mappings."""
         return build_apertus2_mapping_registry(self.hf_config)
+
+    def maybe_modify_loaded_hf_weight(
+        self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Accept old QB exports only when their unused correction buffer is zero."""
+        if isinstance(hf_param, str) and hf_param.endswith(".gate.qb_beta"):
+            correction = hf_param.removesuffix("qb_beta") + "e_score_correction_bias"
+            if correction in hf_state_dict and torch.count_nonzero(hf_state_dict[correction]):
+                raise ValueError(f"QB-only Apertus2 cannot discard nonzero legacy correction buffer {correction}")
+        return super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
 
 
 __all__ = ["Apertus2Bridge"]
